@@ -670,6 +670,7 @@ export class Deck {
     };
     requestAnimationFrame(frame);
     this.practicePanel = new PracticePanel({
+      exportAudio: (format, start, end) => this.exportMix({ format, start, end }),
       snapshot: () => ({
         song: this.r, title: this.r?.title ?? '', seconds: this.length / SR,
         position: this.player.state.pos / SR, playing: this.player.state.playing,
@@ -4543,12 +4544,16 @@ export class Deck {
     }
   }
 
-  private async exportMix() {
+  private exportingMix = false;
+  private async exportMix(selection?: { format: 'wav' | 'mp3'; start: number; end: number }) {
     if (!this.r) return;
-    const o = this.settings();
-    const useLoop = this.loop.on && this.loop.b > this.loop.a;
-    const [start, end] = useLoop ? [this.loop.a, this.loop.b] : [0, this.length];
-    const g = this.gains();
+    if (this.exportingMix) throw new Error('すでに書き出し中です');
+    const o = selection ? { ...this.settings(), format: selection.format, wavDepth: '16' as const, mp3Bitrate: 320 } : this.settings();
+    const useLoop = selection ? true : this.loop.on && this.loop.b > this.loop.a;
+    const [start, end] = selection ? [Math.round(selection.start * SR), Math.min(this.length, Math.round(selection.end * SR))] : useLoop ? [this.loop.a, this.loop.b] : [0, this.length];
+    if (!Number.isFinite(start + end) || start < 0 || end <= start || end > this.length) throw new Error('書き出し範囲が不正です');
+    this.exportingMix = true;
+    const g = this.gains().map(gain => gain * this.masterVolume);
     const on = this.lanes.filter((_, i) => g[i] > 0).map((l) => l.name);
     const bits = [
       on.length === this.lanes.length ? 'mix' : on.join('+') || 'silence',
@@ -4568,8 +4573,10 @@ export class Deck {
       );
     } catch (e) {
       toast(`Export failed: ${(e as Error).message}`, true);
+      if (selection) throw e;
     } finally {
       btn.disabled = false;
+      this.exportingMix = false;
       btn.textContent = 'Export mix';
     }
   }

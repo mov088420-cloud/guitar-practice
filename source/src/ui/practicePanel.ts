@@ -1,3 +1,4 @@
+import { PracticeExport } from './practiceExport.ts';
 import { PracticeTimeline } from './practiceTimeline.ts';
 import type { BeatMode } from '../analysis/beatGrid.ts';
 import { canPreset, presetMix, type PracticeLane, type PracticePreset } from '../practice.ts';
@@ -12,6 +13,7 @@ export interface PracticeSnapshot {
 }
 export interface PracticeHost {
   snapshot(): PracticeSnapshot;
+  exportAudio(format: 'wav' | 'mp3', start: number, end: number): Promise<void>;
   pitch(value: number): void;
   region(a: number, b: number): void;
   beatMode(mode: BeatMode): void;
@@ -45,6 +47,7 @@ export class PracticePanel {
   private loopInfo = h('span', { class: 'muted' });
   private status = h('p', { class: 'gp-status muted', role: 'status' });
   private timeline: PracticeTimeline;
+  private exporter: PracticeExport;
   private playbackBpm = h('input', { type: 'number', step: '.1', 'aria-label': '再生BPM' });
   private bpmReference = h('small', { class: 'muted' });
   private bpmDown: HTMLButtonElement;
@@ -93,7 +96,11 @@ export class PracticePanel {
       this.status.textContent = '元の音量に戻しました。';
       this.render();
     });
-    this.timeline = new PracticeTimeline(host);
+    this.exporter = new PracticeExport(host, () => this.render());
+    this.timeline = new PracticeTimeline({ ...host,
+      snapshot: () => this.exporter.snapshot(host.snapshot()),
+      region: (a, b) => this.exporter.active ? this.exporter.range(a, b) : host.region(a, b),
+    });
     const changeBpm = (value: number) => {
       const s = host.snapshot();
       if (s.sourceBpm > 0 && Number.isFinite(value) && value > 0) host.tempo(Math.max(.5, Math.min(1.5, value / s.sourceBpm)));
@@ -134,6 +141,7 @@ export class PracticePanel {
       this.timeline.el,
       h('div', { class: 'gp-position' }, this.seek),
       h('div', { class: 'gp-tempo-settings' }, h('label', {}, 'テンポ', this.beatModeInput), this.manualFields, this.autoFields),
+      this.exporter.el,
       h('details', { class: 'gp-loop gp-disclosure' }, this.loopSummary, h('div', { class: 'gp-detail-body' }, h('div', { class: 'gp-row' }, button('Aを設定', () => host.loop('a')), button('Bを設定', () => host.loop('b')), button('解除', () => host.loop('clear'))), this.loopInfo)),
       h('details', { class: 'gp-mixer gp-disclosure' }, h('summary', {}, '音量・メトロノームの調整'), h('div', { class: 'gp-detail-body' },
         h('div', { class: 'gp-tools' }, h('label', {}, '全体の音量', this.volume), h('label', {}, 'メトロノームの音量', this.clickVol)),
@@ -230,7 +238,9 @@ export class PracticePanel {
     this.pitchUp.disabled = s.pitch >= 12;
     if (document.activeElement !== this.pitchInput) this.pitchInput.value = String(s.pitch);
     this.offsetInput.max = String(s.seconds);
-    this.timeline.render(s);
+    this.exporter.render(s);
+    this.timeline.setExportMode(this.exporter.active);
+    this.timeline.render(this.exporter.snapshot(s));
     this.volume.value = String(s.volume);
     this.clickVol.value = String(s.clickVol);
     this.click.disabled = this.clickVol.disabled = this.bar.disabled = !s.beats.length;

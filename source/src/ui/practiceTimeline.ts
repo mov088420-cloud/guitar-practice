@@ -5,6 +5,8 @@ import type { PracticeHost, PracticeSnapshot } from './practicePanel.ts';
 /** The existing Deck's peak buffers, rendered as a shared DAW-style time axis. */
 export class PracticeTimeline {
   readonly el = h('div', { class: 'gp-arrangement' });
+  private hint = h('span', { class: 'muted' }, 'クリックで移動 · ドラッグでループ');
+  setExportMode(active: boolean) { this.el.classList.toggle('gp-export-select', active); this.hint.textContent = active ? 'ドラッグで書き出し範囲を選択' : 'クリックで移動 · ドラッグでループ'; }
   private rows = h('div', { class: 'gp-track-rows' });
   private ruler = h('canvas', { class: 'gp-ruler', 'aria-label': '時間目盛り。ドラッグでループ範囲を選択' });
   private cycle = h('div', { class: 'gp-cycle' });
@@ -29,7 +31,7 @@ export class PracticeTimeline {
       this.dirty = true; this.render(s);
     };
     this.scroll.oninput = () => { const s = this.host.snapshot(); this.start = Number(this.scroll.value) / 1000 * Math.max(0, s.seconds - this.span); this.dirty = true; this.render(s); };
-    const toolbar = h('div', { class: 'gp-timeline-toolbar' }, h('span', { class: 'muted' }, 'クリックで移動 · ドラッグでループ'), make('縮小 −', () => zoom(2)), make('拡大 ＋', () => zoom(.5)), make('全体', fit));
+    const toolbar = h('div', { class: 'gp-timeline-toolbar' }, this.hint, make('縮小 −', () => zoom(2)), make('拡大 ＋', () => zoom(.5)), make('全体', fit));
     const area = h('div', { class: 'gp-track-area' }, h('div', { class: 'gp-ruler-row' }, h('span', {}, 'TRACKS'), this.ruler), this.rows, this.cycle, this.playhead);
     this.el.append(toolbar, area, this.scroll);
     this.bindPointer(this.ruler);

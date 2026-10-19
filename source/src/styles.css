@@ -1057,3 +1057,9 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   .gp-musical-control small { font-size: 10px; }
   .gp-musical-control .muted:last-child { flex-basis: 100%; }
 }
+
+.gp-export-fields { display: flex; flex-wrap: wrap; gap: 12px; }
+.gp-export-fields label { display: grid; gap: 6px; flex: 1; min-width: 100px; }
+.gp-export-fields input, .gp-export-fields select { width: 100%; min-height: 44px; }
+.gp-export-select .gp-cycle { border-color: #67d9cf; background: #67d9cf22; }
+.gp-export-fields input { background: var(--surface, #191920); color: inherit; border: 1px solid var(--border, #303039); border-radius: 8px; padding: 8px 12px; }
