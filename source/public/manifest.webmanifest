@@ -1,0 +1,48 @@
+{
+  "name": "Guitar Practice PWA",
+  "short_name": "Guitar Practice",
+  "description": "端末内で音源を分離してギターを練習",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#0f1115",
+  "theme_color": "#0f1115",
+  "icons": [
+    {
+      "src": "icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    },
+    {
+      "src": "icon-maskable.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    },
+    {
+      "src": "icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ],
+  "file_handlers": [
+    {
+      "action": "./",
+      "accept": {
+        "audio/*": [
+          ".mp3",
+          ".wav",
+          ".flac",
+          ".ogg",
+          ".m4a"
+        ]
+      }
+    }
+  ],
+  "lang": "ja"
+}

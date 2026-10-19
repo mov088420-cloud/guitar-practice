@@ -1,0 +1,1 @@
+var e=class extends AudioWorkletProcessor{process(e){let t=e[0]?.[0];return t?.length&&this.port.postMessage({frame:currentFrame,samples:t.slice()}),!0}};registerProcessor(`input-probe`,e);

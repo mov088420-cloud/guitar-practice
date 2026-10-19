@@ -1,0 +1,4576 @@
+import { boundedBpm, loadBeatMode, manualBeats, saveBeatMode, type BeatMode } from '../analysis/beatGrid.ts';
+import { PracticePanel } from './practicePanel.ts';
+import { Player } from '../player/player.ts';
+import { MediaSessionBridge } from './mediaSession.ts';
+import type { Stereo } from '../player/mixcore.ts';
+import { encoder } from '../encode/client.ts';
+import type { Analysis } from '../library.ts';
+import { periodForBpm, retrack } from '../analysis/beats.ts';
+import { keyName, type KeyCandidate, type KeyResult } from '../analysis/key.ts';
+import { gateStep, type Trainer } from '../player/transport.ts';
+import { extensionFor, mimeFor } from '../encode/meta.ts';
+import { stemColour, MODELS } from '../models.ts';
+import { openSink, safeName, saveFile } from '../platform.ts';
+import { MAX_REC_LATENCY_MS, loadLiveChannel, loadLowLatencyAudio, loadRecLatencyMs, saveLiveChannel, saveLowLatencyAudio, saveRecLatencyMs, type LiveChannel, type Settings } from '../settings.ts';
+import { BarTally, barColour, barCue, barTip, type BarScores, type BarVisit } from '../lyrics/barScores.ts';
+import { initNativeAudio } from './nativeAudio.ts';
+import { parseDrums, type DrumNote } from '../lyrics/drumTab.ts';
+import { drawDrumScore } from './drumStaff.ts';
+import { createDropdown, type Dropdown } from './dropdown.ts';
+import { DEFAULT_PART_NAMES, PART_IDS, TAB_FIELDS, defaultTrack, isBuiltinPart, newPartId, normaliseScratch, type ExtraPart, type PartId, type TabPartId } from '../lyrics/tabParts.ts';
+import { placeTake, shiftTake } from '../player/placement.ts';
+import { lineAt, parseLrc, type Lrc } from '../lyrics/lrc.ts';
+import { segmentsFor } from '../lyrics/lyricChords.ts';
+import {
+  acceptedMidis,
+  addAnchor,
+  anchorCoords,
+  charOffsetAt,
+  coordAtBpm,
+  findNoteAt,
+  fromUnrolled,
+  isLockedAt,
+  isAnnotationRow,
+  isRhythmRow,
+  isTimeSigRow,
+  MIN_ANCHORS,
+  moveAnchor,
+  noteCols,
+  noteGroupAt,
+  parseScore,
+  removeAnchor,
+  repeatPlan,
+  setRhythmLetter,
+  tabBlocks,
+  timeAtCoord,
+  toggleAnchorLock,
+  toUnrolled,
+  type RepeatPlan,
+  type TabAnchor,
+  type TabBar,
+  type TabBlock,
+  type TabNote,
+} from '../lyrics/tabSync.ts';
+import { FLAT, isFlat, sameEq, type EqParams } from '../player/eq.ts';
+import { eqPanel, type EqPanel } from './eqPanel.ts';
+import { drawStaff, drawTabScore, noteAt, staffU, staffX, type StaffLayout, type TabScoreLayout } from './staff.ts';
+import { $, fitCanvas, fmtDuration, fmtTime, h, pressed, toast } from './dom.ts';
+import { Transcribe, type TxHost, type TxState } from './transcribePanel.ts';
+import type { Chord } from '../analysis/chords.ts';
+import type { NoteEvent } from '../analysis/basicPitch.ts';
+import type { Cqt } from '../analysis/cqt.ts';
+import { noteName } from '../analysis/cqt.ts';
+import { centsFrom, detectPitch, freqToNote } from '../analysis/pitch.ts';
+
+const SR = 44100;
+/** How far off (in cents, 100ths of a semitone) a live-played note can be and still count as a hit
+ * for the playing trainer — looser than the Tuner's ±5, which is for precise tuning: a fretted note's
+ * natural intonation wanders more than an open string settling into tune. */
+const TRAINER_TOLERANCE_CENTS = 40;
+
+/** Tab-tap ticks and tags on the waveforms: distinct from the loop (cyan), section markers (amber) and the played colour. */
+const TAB_TAP_COLOUR = '#34d399';
+
+export interface Result {
+  title: string;
+  stems: { name: string; data: Stereo }[];
+  settings: Settings;
+  seconds: number;
+  /** Wall-clock seconds the separation took. */
+  took?: number;
+  /** Library folder, once saved. */
+  libId?: string;
+  /** Opened from existing track files rather than separated. */
+  kind?: 'separated' | 'multitrack';
+  analysis?: Analysis;
+  /** Onset envelopes, kept in memory for quick tempo corrections. */
+  onsets?: { env: Float32Array; low: Float32Array };
+  /** Detected (and corrected) chords; MIDI notes per part ("mix" = what you heard). */
+  chords?: Chord[];
+  midi?: Record<string, NoteEvent[]>;
+  /** Note energy per stem for the note view (memory only). */
+  cqt?: Map<string, { c: Cqt; peak: number }>;
+  /** Live-recorded takes, loaded from the library alongside the stems (see the Live input drawer). One entry per recorded source (bass, guitar, ...). */
+  takeGroups?: { id: string; activeTake?: string; takes: { id: string; data: Stereo; note?: string }[] }[];
+}
+
+type Snap = 'off' | 'beat' | 'bar';
+interface PracticeUi {
+  beatMode: BeatMode;
+  manualBpm: number;
+  manualOffset: number;
+  gap: number;
+  countIn: boolean;
+  click: boolean;
+  clickVol: number;
+  perBar: number;
+  barShift: number;
+  snap: Snap;
+  trainer: Trainer;
+}
+const DEFAULT_PR: PracticeUi = {
+  beatMode: 'auto', manualBpm: 120, manualOffset: 0,
+  gap: 0,
+  countIn: false,
+  click: false,
+  clickVol: 0.5,
+  perBar: 4,
+  barShift: 0,
+  snap: 'bar',
+  trainer: { on: false, from: 0.7, to: 1, step: 0.05, every: 1, gate: 0 },
+};
+
+/** Everything about how a song is set up in the player, saved per song. */
+export interface DeckState {
+  masterVolume?: number;
+  lanes: { vol: number; pan: number; mute: boolean; solo: boolean; eq?: EqParams; height?: number; label?: string }[];
+  loop: { on: boolean; a: number; b: number };
+  tempo: number;
+  pitch: number;
+  practice: PracticeUi;
+  markers?: Marker[];
+  /** Note view, chords and MIDI. */
+  tx?: TxState;
+  /** Lyrics, tab, drum tab and free notes, per song. */
+  scratch?: ScratchState;
+  /** Practice log: cumulative seconds this song has actually spent playing (not just open), and
+   * when it was last played. Both persist alongside the rest of the song's saved state. */
+  practiceSeconds?: number;
+  lastPracticed?: number;
+}
+
+/** Plain-text scratchpad, kept simple on purpose: no per-line structure, just what you paste or type. */
+export interface ScratchState {
+  lyrics?: string;
+  /** Show synced (LRC) lyrics as a follow-along view rather than raw text. */
+  lyricsFollow?: boolean;
+  /** Seconds added to every synced lyric's time, to line up a file made for a different recording. */
+  lyricsOffset?: number;
+  /** Show the detected chords over the words of synced lyrics. */
+  lyricsChords?: boolean;
+  tab?: string;
+  /** Tab+ timing: character-offset-into-tab anchors tapped in while playing, for the follow-along
+   * view to interpolate a scroll position between (see src/lyrics/tabSync.ts). */
+  tabAnchors?: TabAnchor[];
+  /** Show the Tab pane as the engraved follow-along view (a tab stave with fret numbers, a rhythm row
+   * under it) rather than the raw editable text. */
+  tabFollow?: boolean;
+  /** Also show a full standard-notation staff underneath the engraved tab. */
+  tabStaff?: boolean;
+  /** Compare live mic pitch against the tab's notes as they play, highlighting right/wrong on the
+   * engraved view. Needs Live input monitoring running and turns tabFollow on if it wasn't already. */
+  tabTrainer?: boolean;
+  /** Ear training: the engraved tab is hidden while the song plays (the Trainer still judges), so you
+   * play from memory; it comes back when playback stops. Needs tabFollow on. */
+  tabEar?: boolean;
+  /** How each bar of the tab was played the last time it came round (from the playing trainer), shown as heat colours on the bar numbers. */
+  tabBarScores?: BarScores;
+  /** Which tab part (guitar or bass) the `tab…` fields above belong to; the other part's are kept in `tabParts`. Guitar when unset. */
+  tabPart?: TabPartId;
+  tabParts?: Record<TabPartId, Pick<ScratchState, (typeof TAB_FIELDS)[number]>>;
+  /** Custom names for the Guitar / Bass / Drums tabs. */
+  partNames?: Record<string, string>;
+  /** Parts the user added (a second guitar, keys, …), after Guitar / Bass / Drums. They use the tab editor like Guitar and Bass. */
+  extraParts?: ExtraPart[];
+  /** The track each part is linked to, by track name ('' = none); unset means the default match (see tabParts.ts). */
+  partTracks?: Record<string, string>;
+  drums?: string;
+  notes?: string;
+}
+
+interface Marker {
+  name: string;
+  pos: number; // frames
+}
+const FINE = 256; // samples per bucket in the fine peak arrays used for zoomed drawing
+// Matches the CSS default track height: below that the waveform becomes too thin to read.
+const LANE_MIN_H = 58;
+// With per-track Pan sliders shown, the control panel grows a row taller: below this the
+// waveform falls short of it again (matches .lanes.show-pan .wave in styles.css).
+const PAN_MIN_H = 88;
+
+interface Lane {
+  /** The small button that opens the tab linked to this track (shown only when one is). */
+  tabBtn?: HTMLButtonElement;
+  name: string;
+  colour: string;
+  vol: number;
+  pan: number;
+  eq?: EqParams;
+  eqPanel?: EqPanel;
+  mute: boolean;
+  solo: boolean;
+  label?: string; // display name; unset shows a formatted `name`. Doesn't affect role detection (chords, MIDI).
+  height?: number; // px; unset uses the CSS default
+  el: HTMLElement;
+  canvas: HTMLCanvasElement;
+  peaks: Float32Array; // fine peaks (FINE samples per bucket)
+  data: Stereo;
+  layers?: [HTMLCanvasElement, HTMLCanvasElement];
+  /** This track's own zoom, independent of the shared view; unset follows the shared view. */
+  ownView?: { start: number; end: number };
+  /** True for a lane that holds live-recorded takes (a song can have several — bass, guitar,
+   * ...); all its takes share this one mixer slot, only the active one is ever actually mixed in. */
+  recordGroup?: boolean;
+  /** Stable internal id for a recordGroup lane, used as its takes' storage filename prefix (its
+   * own display name is just the lane's normal, renameable label — this is never shown). */
+  groupId?: string;
+  takes?: Take[];
+  activeTakeId?: string;
+  takesEl?: HTMLElement; // the collapsed-takes strip under this lane, once it has more than one
+}
+
+interface Take {
+  id: string; // "take-1", "take-2", ... also the saved filename stem
+  data: Stereo;
+  peaks: Float32Array;
+  note?: string; // freeform, e.g. "rushed the bridge" — a reminder for telling takes apart later
+  /** Net shift applied by Line up since the last "Use as latency" (ms, negative = earlier). Not saved. */
+  nudgeMs?: number;
+  /** Recorded by the native engine (so "Use as latency" adjusts the native value, not the web one). Not saved. */
+  native?: boolean;
+}
+
+type LanePatch = Partial<Pick<Lane, 'vol' | 'pan' | 'mute' | 'solo' | 'eq'>>;
+/** One undoable mixer action: before/after only cover the fields that actually changed. */
+interface LaneHistoryEntry {
+  lane: Lane;
+  before: LanePatch;
+  after: LanePatch;
+}
+
+/** Peak level per FINE-sample bucket, averaged across channels. */
+function peaksOf(chs: Float32Array[]) {
+  const n = chs[0].length;
+  const out = new Float32Array(Math.ceil(n / FINE));
+  for (let b = 0; b < out.length; b++) {
+    let m = 0;
+    const end = Math.min(n, (b + 1) * FINE);
+    for (let i = b * FINE; i < end; i += 2) {
+      let v = 0;
+      for (const c of chs) v += Math.abs(c[i]);
+      if (v > m) m = v;
+    }
+    out[b] = m / chs.length;
+  }
+  return out;
+}
+
+/** Peaks for frames [start, end) at `buckets` resolution: from the fine array, or raw samples when zoomed in far. */
+function peaksForView(fine: Float32Array, chs: Float32Array[], start: number, end: number, buckets: number) {
+  const out = new Float32Array(buckets);
+  const spb = (end - start) / buckets;
+  for (let b = 0; b < buckets; b++) {
+    const s = start + b * spb;
+    const e = start + (b + 1) * spb;
+    let m = 0;
+    if (spb >= FINE) {
+      for (let k = Math.floor(s / FINE); k < Math.min(fine.length, Math.ceil(e / FINE)); k++) m = Math.max(m, fine[k]);
+    } else {
+      for (let i = Math.floor(s); i < Math.min(chs[0].length, Math.ceil(e)); i++) {
+        let v = 0;
+        for (const c of chs) v += Math.abs(c[i]);
+        m = Math.max(m, v / chs.length);
+      }
+    }
+    out[b] = m;
+  }
+  return out;
+}
+
+/** Pre-render a waveform in one colour to an offscreen canvas. */
+/** A track's display name: its own rename if it has one, else a tidied-up stem name. */
+function laneLabel(l: Pick<Lane, 'name' | 'label'>) {
+  return l.label ?? (l.name.startsWith('no_') ? `No ${l.name.slice(3)}` : l.name);
+}
+
+/** Restores a line's leading "label|" (e.g. "HH|") if it's been damaged: the pipe deleted on its own, or the whole prefix gone. Already-correct lines pass through unchanged. */
+function fixLinePrefix(line: string, templateLine: string) {
+  const pipeIdx = templateLine.indexOf('|');
+  if (pipeIdx < 0) return line;
+  const label = templateLine.slice(0, pipeIdx);
+  const prefix = templateLine.slice(0, pipeIdx + 1);
+  if (line.startsWith(prefix)) return line;
+  if (line.startsWith(label)) return `${label}|${line.slice(label.length)}`;
+  return prefix + line;
+}
+
+/**
+ * Adds more bars to a tab/drum-tab, each line's own trailing "|" kept at the end so the lines
+ * stay lined up. An empty box gets the blank template back rather than nothing to extend. Within
+ * the template's line count, any row that's missing or was emptied out (a string deleted along
+ * with its content, not just missing from the end) gets that string's line restored from the
+ * template, brought up to the other lines' width, before everyone gets the new bars. A line whose
+ * leading "label|" was damaged (e.g. just the "|" deleted) gets that fixed too, not just extended
+ * as-is. Extra lines past the template (freeform notes below the tab) are left alone if blank,
+ * extended if not.
+ */
+function extendTabText(text: string, template: string, addChars = 16) {
+  if (!text.trim()) return template;
+  const templateLines = template.split('\n');
+  const all = text.split('\n');
+  // Lines before the strings that aren't strings — a "4/4" time signature, picking/fingering marks —
+  // are set aside and put back untouched: everything below assumes the first lines are the strings.
+  let lead = 0;
+  while (lead < all.length && all[lead].trim() && (isTimeSigRow(all[lead]) || isAnnotationRow(all[lead]))) lead++;
+  const head = all.slice(0, lead);
+  const lines = all.slice(lead);
+  while (lines.length < templateLines.length) lines.push('');
+  for (let i = 0; i < templateLines.length; i++) lines[i] = lines[i].trim() ? fixLinePrefix(lines[i], templateLines[i]) : templateLines[i];
+  const maxLen = Math.max(...lines.slice(0, templateLines.length).map((l) => l.length));
+  const pad = (line: string, len: number, ch: string) => (line.endsWith('|') ? `${line.slice(0, -1)}${ch.repeat(len)}|` : line + ch.repeat(len));
+  const extended = lines.map((line, i) => {
+    // (a rhythm line has no dashes to extend; nor does a line of marks — dashes there would stretch a palm-mute run)
+    if (i >= templateLines.length) return line.trim() && !isRhythmRow(line) && !isAnnotationRow(line) ? pad(line, addChars, '-') : line;
+    if (line.length < maxLen) line = pad(line, maxLen - line.length, '-');
+    return pad(line, addChars, '-');
+  });
+  return [...head, ...extended].join('\n');
+}
+
+function waveLayer(peaks: Float32Array, w: number, hgt: number, colour: string, scale: number) {
+  const c = document.createElement('canvas');
+  c.width = w;
+  c.height = hgt;
+  const g = c.getContext('2d')!;
+  g.fillStyle = colour;
+  const mid = hgt / 2;
+  const barW = Math.max(1, Math.round(w / 700));
+  for (let x = 0; x < w; x += barW + 1) {
+    const b0 = Math.floor((x / w) * peaks.length);
+    const b1 = Math.max(b0 + 1, Math.floor(((x + barW) / w) * peaks.length));
+    let m = 0;
+    for (let b = b0; b < b1; b++) m = Math.max(m, peaks[b]);
+    const hh = Math.max(1, Math.min(1, m * scale) * (mid - 2));
+    g.fillRect(x, mid - hh, barW, hh * 2);
+  }
+  return c;
+}
+
+/** Cancels the mouse press's own default on a waveform/overview, the thing that lets WebKit start a
+ * native drag (a ghost image of the canvas following the mouse) or a text selection. Pointer events
+ * carry the actual scrub/section dragging and are untouched. Cancelling mousedown also stops the
+ * press moving focus off a text box as usual, and the global shortcut keys are ignored while one has
+ * focus — so focus is dropped by hand, as the press would have. */
+function noNativeDrag(e: MouseEvent) {
+  if (e.button !== 0) return;
+  e.preventDefault();
+  (document.activeElement as HTMLElement | null)?.blur?.();
+}
+
+export class Deck {
+  player = new Player();
+  private seekToastAt = 0;
+  /** Reapplies a floating Scratchpad's saved position once #deck is actually visible to measure into
+   * (set by initScratchFloat(); a no-op call before then, in case something races the constructor). */
+  private restoreScratchFloat: () => void = () => {};
+  /** OS media keys / lock-screen controls, and keeping the screen awake while a song plays. */
+  private media = new MediaSessionBridge({
+    play: () => void this.player.play(),
+    pause: () => this.player.pause(),
+    restart: () => this.restart(),
+    skip: (s) => this.skip(s),
+    seek: (s) => this.player.seek(s * SR),
+  });
+  private notifySeekBlocked = () => {
+    if (performance.now() - this.seekToastAt < 2000) return;
+    this.seekToastAt = performance.now();
+    toast('Stop recording to move the playhead');
+  };
+  private encoder = encoder;
+  private pr: PracticeUi = structuredClone(DEFAULT_PR);
+  private taps: number[] = [];
+  private quiet = false; // suppress state-change events while restoring a song
+  /** Called (often) whenever the player setup changes; the caller debounces saving. */
+  onStateChange: (s: DeckState) => void = () => {};
+  /** The song played through to its end (not a loop coming round). */
+  onEnded: () => void = () => {};
+  /** Fires on every playback tick while actually playing, with seconds left in the song — e.g. for
+   * a setlist to start fading out shortly before the natural end. Not fired while looping/paused. */
+  onNearEnd: (secondsLeft: number) => void = () => {};
+  /** Called when a tempo correction changes the song's analysis. */
+  onAnalysisChange: (r: Result) => void = () => {};
+  /** Called when the song is renamed, so the library entry (if any) can be updated. */
+  onRename: (title: string) => void = () => {};
+  /** A new take was recorded and is now the active one; save it (and which one is active) to the library, if this song is kept there. `groupId` identifies which recording (bass, guitar, ...) it belongs to. */
+  onTakeAdded: (groupId: string, take: { id: string; data: Stereo; note?: string }) => Promise<void> = () => Promise.resolve();
+  /** A different existing take was switched to. */
+  onTakeSelected: (groupId: string, takeId: string) => void = () => {};
+  /** A take was discarded; remove it from the library, if this song is kept there. */
+  onTakeRemoved: (groupId: string, takeId: string) => Promise<void> = () => Promise.resolve();
+  /** A take's audio was moved by Line up; re-save it under the same id (`libId` is the song it belonged to). */
+  onTakeReplaced: (libId: string | undefined, groupId: string, take: { id: string; data: Stereo; note?: string }) => Promise<void> = () => Promise.resolve();
+  /** A take's note was edited; metadata only, no audio to re-save. */
+  onTakeNoteChanged: (groupId: string, takeId: string, note: string) => void = () => {};
+  /** Ranks keys for the song, or for a range of frames. */
+  rankKeys: (r: Result, start?: number, end?: number) => Promise<KeyCandidate[]> = () => Promise.resolve([]);
+  /** Provides onset envelopes for a song that doesn't have them in memory. */
+  needOnsets: (r: Result) => Promise<{ env: Float32Array; low: Float32Array }> = () => Promise.reject(new Error('unavailable'));
+  private r: Result | null = null;
+  private lanes: Lane[] = [];
+  /** Mixer undo/redo (mute/solo/vol/pan/EQ): cleared whenever a song opens or closes, since it
+   * refers to specific Lane objects that don't survive either. */
+  private laneUndo: LaneHistoryEntry[] = [];
+  private laneRedo: LaneHistoryEntry[] = [];
+  /** Practice log: cumulative seconds actually spent playing this song (not just open), and when
+   * it was last played. lastPracticeTick is a wall-clock timestamp, not persisted — just used to
+   * measure the gap since the previous playing tick. */
+  private practiceSeconds = 0;
+  private lastPracticed?: number;
+  private lastPracticeTick: number | null = null;
+  /** The track scroll-to-zoom applies to; others just scroll the page. Click a track to pick it. */
+  private selectedLane: Lane | null = null;
+  private stopLiveInputUi: () => void = () => {};
+  private refreshRecordTargetsUi: () => void = () => {};
+  private overviewPeaks = new Float32Array(0);
+  private overviewScale = 1;
+  private laneScale = 1;
+  private markers: Marker[] = [];
+  private view = { start: 0, end: 1 };
+  private pedal = false;
+  private overviewLayers: [HTMLCanvasElement, HTMLCanvasElement] | null = null;
+  private loop = { on: false, a: 0, b: 0 };
+  private practicePanel?: PracticePanel;
+  private readonly emptyBeatMap: number[] = [];
+  private manualClock = { key: '', beats: [] as number[] };
+  private beatPending = new WeakSet<Result>();
+  private get beatBusy() { return !!this.r && this.beatPending.has(this.r); }
+  requestBeatAnalysis: (r: Result) => Promise<void> = async () => {};
+  get beatMode(): BeatMode { return this.r ? this.pr.beatMode : loadBeatMode(); }
+  private beatSeconds(): number[] {
+    if (this.pr.beatMode !== 'manual') return this.r?.analysis?.beats ?? this.emptyBeatMap;
+    const key = `${this.length}:${this.pr.manualBpm}:${this.pr.manualOffset}`;
+    if (key !== this.manualClock.key) this.manualClock = { key, beats: manualBeats(this.length / SR, this.pr.manualBpm, this.pr.manualOffset) };
+    return this.manualClock.beats;
+  }
+  private async analyseBeatMap() {
+    const r = this.r;
+    if (!r || this.beatMode !== 'auto' || this.beatBusy) return;
+    this.beatPending.add(r);
+    this.practicePanel?.render();
+    try { await this.requestBeatAnalysis(r); }
+    catch (e) { toast(`拍を解析できませんでした: ${(e as Error).message}`, true); }
+    finally { this.beatPending.delete(r); this.practicePanel?.render(); }
+  }
+
+  private masterVolume = 0.9;
+  private tempo = 1;
+  private pitch = 0;
+  private dirty = true;
+  private drag: { x0: number; moved: boolean; edge?: 'a' | 'b'; scrub?: boolean } | null = null;
+  onRerun: () => void = () => {};
+  private tx: Transcribe;
+  private scratch: ScratchState = {};
+  private scratchTab: 'lyrics' | 'tab' | 'drums' | 'notes' = 'lyrics';
+  /** Opens a part's tab (set by initScratchpad), and the drawer it lives in (set by initDrawer). */
+  private showPart: (id: PartId) => void = () => {};
+  private openDrawer: (name: string | null) => void = () => {};
+  private partTrackDd: Dropdown | null = null;
+  private partBtns!: Record<PartId, HTMLButtonElement>;
+  private addPartBtn!: HTMLButtonElement;
+  /** The lyrics text parsed as LRC, or null if it's plain lyrics. */
+  private lrc: Lrc | null = null;
+  private lyricEls: HTMLElement[] = [];
+  private lyricIdx = -2;
+  /** What the lyric chords were last drawn from, and the chord pieces of the current line (to light the one sounding). */
+  private lyricChordKey = '';
+  private lyricChordEls: { t: number; el: HTMLElement }[] = [];
+  private lyricChordNow = -1;
+  /** The tab's block layout and tap coordinates, rebuilt only when the text or taps change (not every frame). */
+  private tabTimeline: { text: string; anchors: TabAnchor[]; blocks: TabBlock[]; coords: TabAnchor[]; plan: RepeatPlan | null; coordsU: TabAnchor[] } | null = null;
+  // ---- the engraved tab (fret numbers + rhythm row, follow-along's read-only view — see staff.ts's
+  // drawTabScore) and the separate, optional full staff (drawStaff): same pattern for both, a redrawn-
+  // on-change layout plus a "last drawn x" to skip redundant per-frame work once it hasn't moved. ----
+  private stripLayout: TabScoreLayout | null = null;
+  private stripText: string | null = null;
+  /** The same parse's raw notes (string/fret/midi/start/length), kept alongside stripLayout's geometry
+   * for the playing trainer to compare against, without re-parsing the tab on every trainer tick. */
+  private stripNotes: TabNote[] | null = null;
+  private stripBars: TabBar[] = [];
+  /** The last bar clicked to loop it, so a Shift-click can extend from there. */
+  private lastLoopBar: number | null = null;
+  private stripToken = 0;
+  private stripTimer: number | undefined;
+  private lastStripPx = NaN;
+  /** A manual scroll of Follow along (dragging it, or arrow-key navigation off the edge): how far, in
+   * the tab's own position units, the view is shifted from where playback actually is. Only means
+   * anything while the position it was set at holds still — see viewCoord. */
+  private tabPan = 0;
+  private tabPanAt = 0;
+  private tabPanMoved = false;
+  private tabSymbolsOpen = false;
+  private staffLayout: StaffLayout | null = null;
+  private staffText: string | null = null;
+  private staffToken = 0;
+  private staffTimer: number | undefined;
+  private lastStaffPx = NaN;
+  // ---- playing trainer: compares live mic pitch against stripNotes as they play (see initTrainer) ----
+  /** Notes hit vs. total finalized so far this pass; reset on trainer-on, song change, or a backward
+   * seek (a loop restart or scrub back) — a fresh tally per pass, not accumulated across loops. */
+  private trainerTotal = 0;
+  private trainerHit = 0;
+  /** The current note-group's own start (u), and whether it's been matched at any point during its
+   * window — finalized into trainerTotal/trainerHit only once u moves past it, so a brief silence
+   * right after a correct hit doesn't retroactively read as a miss. */
+  private trainerGroupStart: number | null = null;
+  private trainerGroupHit = false;
+  /** Bar the note group being judged is in, and the running per-bar tally the heat colours come from. */
+  private trainerGroupBar = -1;
+  private barTally = new BarTally();
+  private trainerLastU = 0;
+  /** The gated speed trainer (Trainer.gate): consecutive passes played well enough so far at this
+   * speed, and a line about the last pass for the Practice pane. */
+  private trainerClean = 0;
+  private gateStatus = '';
+  private scratchAreas!: { lyrics: HTMLTextAreaElement; tab: HTMLTextAreaElement; drums: HTMLTextAreaElement; notes: HTMLTextAreaElement };
+  // ---- a live recording being drawn in as its own track while it's captured ----
+  private recordLane: Lane | null = null;
+  private recordStartPos = 0;
+  private nudgeSaveTimers = new Map<Take, number>();
+  /** Sets the latency box and the saved value; wired up by the Live input panel. */
+  private setRecLatency: (ms: number, native?: boolean) => void = (ms, native) => saveRecLatencyMs(ms, !!native);
+  /** Song frame a punch-in take must stop at (the end of the loop), or null for an ordinary take. */
+  private recordPunchEnd: number | null = null;
+  private recordDrawTimer = 0;
+
+  constructor(private settings: () => Settings) {
+    this.player.onSeekBlocked = this.notifySeekBlocked;
+    this.player.onState = (s) => {
+      $('playBtn').classList.toggle('on', s.playing);
+      this.media.setPlaying(s.playing);
+      if (s.ended) this.onEnded();
+      else if (s.playing) this.onNearEnd((this.length - s.pos) / SR);
+      this.trackPractice(s.playing);
+      // The speed trainer changes tempo inside the player; mirror it here.
+      if (this.pr.trainer.on && Math.abs(s.tempo - this.tempo) > 1e-6) {
+        this.tempo = s.tempo;
+        this.showTempoPitch();
+        this.emit();
+      }
+      this.updateTrainerInfo(s.passes, s.countingIn);
+      this.updateEarHide();
+      this.dirty = true;
+      this.practicePanel?.render();
+    };
+    $('trackTitle').ondblclick = () => this.renameSong();
+    $('playBtn').onclick = () => this.toggle();
+    // With a loop on, this goes to the loop's start (the engine keeps the playhead inside a live
+    // loop anyway); Shift+click goes to the start of the whole song, switching the loop off to do so.
+    $('toStartBtn').onclick = (e) => {
+      if (this.loop.on && this.loop.b > this.loop.a) {
+        if (!(e as MouseEvent).shiftKey) return this.player.seek(this.loop.a);
+        this.setLoop(false);
+        toast('Loop switched off. Press Loop to turn it back on.');
+      }
+      this.player.seek(0);
+    };
+    $('toEndBtn').onclick = () => this.player.seek(Math.max(0, this.length - SR));
+    $('rewindBtn').onclick = () => this.skip(-5);
+    $('ffBtn').onclick = () => this.skip(5);
+    $('loopBtn').onclick = () => this.setLoop(!this.loop.on);
+    $('setA').onclick = () => this.setPoint('a');
+    $('setB').onclick = () => this.setPoint('b');
+    $('clearLoop').onclick = () => this.clearLoop();
+    $('saveAllBtn').onclick = () => this.saveAll();
+    $('exportMixBtn').onclick = () => this.exportMix();
+    $('rerunBtn').onclick = () => this.onRerun();
+    const tempo = $<HTMLInputElement>('tempo');
+    const pitch = $<HTMLInputElement>('pitch');
+    tempo.oninput = () => this.setTempoPitch(Number(tempo.value), this.pitch);
+    pitch.oninput = () => this.setTempoPitch(this.tempo, Number(pitch.value));
+    for (const b of document.querySelectorAll<HTMLElement>('[data-reset]'))
+      b.onclick = () => (b.dataset.reset === 'tempo' ? this.setTempoPitch(1, this.pitch) : this.setTempoPitch(this.tempo, 0));
+    $<HTMLInputElement>('volume').oninput = (e) => this.setMasterVolume(Number((e.target as HTMLInputElement).value));
+    // Pan sliders are hidden unless switched on (remembered).
+    const panBtn = $('panToggle');
+    const showPan = (on: boolean) => {
+      pressed(panBtn, on);
+      $('lanes').classList.toggle('show-pan', on);
+      // Tracks with an explicit (drag-resized) height keep it, but never smaller than what
+      // the current control panel needs, so toggling Pan can't leave them shorter than it.
+      const floor = this.laneMinH();
+      for (const l of this.lanes) {
+        if (l.height == null) continue;
+        (l.el.querySelector('.wave') as HTMLElement).style.height = `${Math.max(l.height, floor)}px`;
+      }
+      try {
+        localStorage.setItem('steminize.showPan', on ? '1' : '');
+      } catch {
+        /* ignore */
+      }
+    };
+    let panOn = false;
+    try {
+      panOn = localStorage.getItem('steminize.showPan') === '1';
+    } catch {
+      /* ignore */
+    }
+    showPan(panOn);
+    panBtn.onclick = () => showPan(panBtn.getAttribute('aria-pressed') !== 'true');
+    this.initPractice();
+    this.initMarkersAndZoom();
+    this.initKeyPanel();
+    this.initDrawer();
+    this.initScratchFloat();
+    this.initOverview();
+    this.initKeys();
+    this.initLiveInput();
+    this.player.onNativeLost = (message) => {
+      toast(`Native audio stopped: ${message} Switched back to the browser audio engine.`, true, 9000);
+      this.fallbackToWeb();
+    };
+    initNativeAudio(this.player);
+    this.initTuner();
+    this.initTrainer();
+    this.initScratchpad();
+    const host: TxHost = {
+      player: this.player,
+      song: () => this.r,
+      view: () => this.view,
+      gains: () => this.gains(),
+      pans: () => this.pans(),
+      eqs: () => this.eqs(),
+      lanes: () => this.lanes.map((l) => ({ name: l.name, colour: l.colour })),
+      pitch: () => this.pitch,
+      loop: () => this.loop,
+      markers: () => this.markers,
+      beats: () => this.r?.analysis?.beats ?? [],
+      downbeat: () => this.downbeat(),
+      perBar: () => this.pr.perBar,
+      bpm: () => this.r?.analysis?.bpm,
+      key: () => this.r?.analysis?.key,
+      keyLabel: () => {
+        const k = this.r?.analysis?.key;
+        return k ? keyName(k, this.pitch) : undefined;
+      },
+      seekFrac: (f) => this.seekFrac(f),
+      wheel: (e, el) => this.onWheel(e, el),
+      changed: () => this.emit(),
+      redraw: () => (this.dirty = true),
+      baseName: () => this.baseName(),
+      smoothPos: () => this.smoothStripPos(),
+      loopFrames: (a, b) => {
+        this.loop.a = Math.max(0, Math.round(a));
+        this.loop.b = Math.min(this.length, Math.round(b));
+        this.setLoop(true);
+        this.player.seek(this.loop.a);
+      },
+    };
+    this.tx = new Transcribe(host);
+    new ResizeObserver(() => this.invalidateLayers()).observe($('deck'));
+    const frame = () => {
+      if (this.r && this.tx.stripShown) this.tx.drawStrip(); // the chord timeline moves every screen frame, like the tab strip
+      if (this.dirty && this.r) this.draw();
+      // The tab scroll strip moves every screen frame while playing, not just when a player report lands.
+      else if (this.r && this.player.state.playing) {
+        if (!$('tabStrip').hidden) this.updateTabStrip();
+        this.updateTabStaff();
+      }
+      requestAnimationFrame(frame);
+    };
+    requestAnimationFrame(frame);
+    this.practicePanel = new PracticePanel({
+      snapshot: () => ({
+        song: this.r, title: this.r?.title ?? '', seconds: this.length / SR,
+        position: this.player.state.pos / SR, playing: this.player.state.playing,
+        tempo: this.tempo, pitch: this.pitch, volume: this.masterVolume,
+        sourceBpm: this.pr.beatMode === 'manual' ? this.pr.manualBpm : this.r?.analysis?.bpm ?? 0,
+        lanes: this.lanes.map((l) => ({ name: l.name, vol: l.vol, mute: l.mute, solo: l.solo, peaks: l.peaks, colour: l.colour })),
+        loop: { on: this.loop.on, a: this.loop.a / SR, b: this.loop.b / SR },
+        click: this.pr.click, clickVol: this.pr.clickVol, beats: this.beatSeconds(),
+        beatMode: this.beatMode, manualBpm: this.pr.manualBpm, manualOffset: this.pr.manualOffset, beatBusy: this.beatBusy,
+        downbeat: this.downbeat(), perBar: this.pr.perBar,
+      }),
+      toggle: () => this.toggle(),
+      seek: (seconds) => this.player.seek(seconds * SR),
+      tempo: (value) => this.setTempoPitch(value, this.pitch),
+      pitch: (value) => this.setTempoPitch(this.tempo, Math.max(-12, Math.min(12, Math.round(value)))),
+      beatMode: (mode) => {
+        this.pr.beatMode = mode; saveBeatMode(mode); this.practiceChanged();
+        if (mode === 'auto' && !this.r?.analysis?.beats.length) void this.analyseBeatMap();
+      },
+      manualTempo: (bpm, offset) => { this.pr.manualBpm = boundedBpm(bpm); this.pr.manualOffset = Math.max(0, Math.min(this.length / SR, Number.isFinite(offset) ? offset : 0)); this.pr.barShift = 0; this.practiceChanged(); },
+      reanalyse: () => { void this.analyseBeatMap(); },
+      correctTempo: (factor) => { if (this.r?.analysis?.bpm && !this.beatBusy) void this.retempo(this.r.analysis.bpm * factor); },
+      region: (a, b) => {
+        if (this.player.recording) return this.notifySeekBlocked();
+        const start = Math.max(0, Math.min(this.length / SR, Math.min(a, b)));
+        const end = Math.max(0, Math.min(this.length / SR, Math.max(a, b)));
+        if (!Number.isFinite(start + end) || end - start < .25) return;
+        this.loop.a = Math.round(start * SR); this.loop.b = Math.round(end * SR);
+        this.setLoop(true); this.player.seek(this.loop.a);
+      },
+      volume: (value) => this.setMasterVolume(value),
+      lane: (i, patch) => {
+        const lane = this.lanes[i];
+        if (!lane) return;
+        this.setLane(lane, patch);
+        this.syncLaneSliders(lane, patch);
+      },
+      mix: (mix) => {
+        mix.forEach((m, i) => {
+          const lane = this.lanes[i];
+          if (!lane || lane.name !== m.name) return;
+          const patch = { vol: m.vol, mute: m.mute, solo: m.solo };
+          this.setLane(lane, patch);
+          this.syncLaneSliders(lane, patch);
+        });
+      },
+      loop: (action) => {
+        if (action === 'toggle') this.setLoop(!this.loop.on);
+        else if (action === 'clear') this.clearLoop();
+        else this.setPoint(action);
+      },
+      click: () => { this.pr.click = !this.pr.click; this.practiceChanged(); },
+      clickVolume: (v) => { this.pr.clickVol = v; this.practiceChanged(); },
+      bar: () => { this.pr.barShift = (this.pr.barShift + 1) % this.pr.perBar; this.practiceChanged(); },
+    });
+  }
+
+  private setMasterVolume(value: number) {
+    this.masterVolume = Math.max(0, Math.min(1, value));
+    this.player.setVolume(this.masterVolume);
+    $<HTMLInputElement>('volume').value = String(this.masterVolume);
+    this.emit();
+  }
+
+  get current() {
+    return this.r;
+  }
+
+  /** Builds one track's DOM and wiring (mute/solo/EQ/vol/pan/rename/resize/zoom/export) and appends it to #lanes. Shared by the initial song-open loop and by a finished live recording, which adds itself as a lane the same way. */
+  private buildLane(s: { name: string; data: Stereo }, i: number, colourOverride?: string): Lane {
+    const colour = colourOverride ?? stemColour(s.name, i);
+    const canvas = h('canvas');
+    const mute = h('button', { class: 'ms m', type: 'button', title: `Mute (${i + 1})` }, 'M');
+    const solo = h('button', { class: 'ms s', type: 'button', title: 'Solo' }, 'S');
+    const eqBtn = h('button', { class: 'ms eq', type: 'button', title: 'EQ: presets, low/high cut and a focus band' }, 'EQ');
+    const dl = h('button', { class: 'dl', type: 'button', title: `Save ${laneLabel({ name: s.name })}` });
+    dl.innerHTML =
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v11m0 0-4-4m4 4 4-4M5 20h14"/></svg>';
+    const tabBtn = h('button', { class: 'ms lane-tab', type: 'button', hidden: true, title: 'Open the tab for this track' }, 'Tab');
+    const vol = h('input', { type: 'range', min: '0', max: '1.5', step: '0.01', value: '1', title: 'Level' });
+    const pan = h('input', { type: 'range', min: '-1', max: '1', step: '0.05', value: '0', title: 'Pan (double-click to centre)' });
+    const panOut = h('output', {}, 'C');
+    const nameBtn = h(
+      'button',
+      { class: 'name', type: 'button', title: 'Double-click to rename' },
+      laneLabel({ name: s.name }),
+      h('span', { class: 'take-badge muted' }),
+    );
+    const ctl = h(
+      'div',
+      { class: 'lane-ctl' },
+      nameBtn,
+      mute,
+      solo,
+      eqBtn,
+      dl,
+      tabBtn,
+      h('label', { class: 'mini vol' }, h('span', {}, 'Vol'), vol),
+      h('label', { class: 'mini pan' }, h('span', {}, 'Pan'), pan, panOut),
+    );
+    const wave = h('div', { class: 'wave', title: 'Click to seek and pick this track; scroll to zoom once it’s picked' }, canvas);
+    const resizeHandle = h('div', {
+      class: 'lane-resize',
+      title: 'Drag to resize this track (or Shift with + / − for every track). Double-click to reset.',
+    });
+    const el = h('div', { class: 'lane', style: `--c:${colour}` }, ctl, wave, resizeHandle);
+    $('lanes').append(el);
+    const lane: Lane = { name: s.name, colour, vol: 1, pan: 0, mute: false, solo: false, el, canvas, peaks: peaksOf(s.data), data: s.data, tabBtn };
+    tabBtn.onclick = () => this.openPartForLane(lane);
+    eqBtn.onclick = () => this.toggleEq(lane, lane.colour);
+    pressed(eqBtn, false);
+    nameBtn.ondblclick = () => this.renameLane(lane, nameBtn, dl);
+    mute.onclick = () => this.setLaneRecorded(lane, { mute: !lane.mute });
+    solo.onclick = () => this.setLaneRecorded(lane, { solo: !lane.solo });
+    // Live-apply on every 'input' (so dragging feels immediate) but record only one undo step per
+    // gesture, on 'change' (drag release, or a single keypress on a focused slider) — comparing
+    // against the value from when the gesture started (captured on focus, which precedes both a
+    // click-drag and keyboard use), not one step per 'input' event.
+    vol.oninput = () => this.setLane(lane, { vol: Number(vol.value) });
+    let volGestureStart = lane.vol;
+    vol.addEventListener('focus', () => (volGestureStart = lane.vol));
+    vol.addEventListener('change', () => {
+      this.pushLaneHistory(lane, { vol: volGestureStart }, { vol: lane.vol });
+      volGestureStart = lane.vol;
+    });
+    const setPan = (v: number) => {
+      pan.value = String(v);
+      panOut.textContent = v === 0 ? 'C' : `${v < 0 ? 'L' : 'R'}${Math.round(Math.abs(v) * 100)}`;
+      this.setLane(lane, { pan: v });
+    };
+    let panGestureStart = lane.pan;
+    pan.oninput = () => setPan(Number(pan.value));
+    pan.addEventListener('focus', () => (panGestureStart = lane.pan));
+    pan.addEventListener('change', () => {
+      this.pushLaneHistory(lane, { pan: panGestureStart }, { pan: lane.pan });
+      panGestureStart = lane.pan;
+    });
+    pan.ondblclick = () => {
+      const before = lane.pan;
+      setPan(0);
+      this.pushLaneHistory(lane, { pan: before }, { pan: 0 });
+      panGestureStart = lane.pan;
+    };
+    dl.onclick = () => this.saveStem(this.lanes.indexOf(lane));
+    // Click seeks; dragging scrubs; Shift-dragging across the lane marks a loop section, like the
+    // overview strip does (the section is marked but the loop is left off, so it doesn't yank playback).
+    // Mouse/pen only: on touch a drag has to keep scrolling the page.
+    const laneFrame = (e: PointerEvent) => {
+      const view = lane.ownView ?? this.view;
+      const f = Math.max(0, Math.min(1, (e.clientX - wave.getBoundingClientRect().left) / wave.clientWidth));
+      return { f, frame: view.start + f * (view.end - view.start) };
+    };
+    let laneDrag: { f0: number; frame0: number; moved: boolean; edge?: 'a' | 'b'; scrub?: boolean } | null = null;
+    let swallowClick = false; // a drag ends in a click event; don't let it also seek
+    // Belt and braces with user-select:none (styles.css): WebKitGTK is what the real app runs on, and
+    // this drag only ever means scrub/section, never "select text" or "drag this somewhere".
+    wave.addEventListener('selectstart', (e) => e.preventDefault());
+    wave.addEventListener('dragstart', (e) => e.preventDefault());
+    wave.addEventListener('mousedown', noNativeDrag);
+    wave.addEventListener('pointerdown', (e) => {
+      swallowClick = false; // a drag that produced no click must not eat the next real one
+      if (e.button !== 0 || e.pointerType === 'touch') return;
+      wave.setPointerCapture(e.pointerId);
+      const { f, frame } = laneFrame(e);
+      const view = lane.ownView ?? this.view;
+      const edge = this.loopEdgeAt(f * wave.clientWidth, wave.clientWidth, view);
+      const scrub = !edge && !e.shiftKey;
+      laneDrag = { f0: f, frame0: frame, moved: false, edge: edge ?? undefined, scrub };
+    });
+    wave.addEventListener('pointermove', (e) => {
+      const { f, frame } = laneFrame(e);
+      if (!laneDrag) {
+        const view = lane.ownView ?? this.view;
+        const px = f * wave.clientWidth;
+        wave.style.cursor = this.loopEdgeAt(px, wave.clientWidth, view) ? 'ew-resize' : '';
+        return;
+      }
+      if (laneDrag.scrub) {
+        if (Math.abs(f - laneDrag.f0) * wave.clientWidth > 2) laneDrag.moved = true;
+        if (laneDrag.moved) this.scrubTo(frame);
+        return;
+      }
+      if (laneDrag.edge) {
+        if (Math.abs(f - laneDrag.f0) * wave.clientWidth > 3) laneDrag.moved = true;
+        if (laneDrag.moved) this.dragLoopEdge(laneDrag.edge, frame);
+        return;
+      }
+      if (Math.abs(f - laneDrag.f0) * wave.clientWidth > 6) laneDrag.moved = true;
+      if (!laneDrag.moved) return;
+      this.dragSection(Math.min(laneDrag.frame0, frame), Math.max(laneDrag.frame0, frame));
+    });
+    wave.addEventListener('pointerup', () => {
+      if (laneDrag?.moved) {
+        swallowClick = true;
+        if (laneDrag.scrub) {
+          // already scrubbed; nothing to commit
+        } else if (laneDrag.edge) this.finishLoopEdgeDrag();
+        else {
+          this.snapLoop();
+          this.updateLoopUi();
+          this.emit();
+        }
+      }
+      laneDrag = null;
+    });
+    wave.addEventListener('pointercancel', () => (laneDrag = null));
+    wave.onclick = (e) => {
+      if (swallowClick) {
+        swallowClick = false;
+        return;
+      }
+      const view = lane.ownView ?? this.view;
+      const f = Math.max(0, Math.min(1, e.offsetX / wave.clientWidth));
+      this.player.seek(view.start + f * (view.end - view.start));
+    };
+    // Scroll-to-zoom only acts on the picked track, zooming just that track, so scrolling
+    // the page past the others doesn't hijack it or change what they're showing. Shift+scroll
+    // (sideways panning) works over any track though, since it doesn't fight page scrolling:
+    // a track with its own zoom pans itself, any other pans the shared view.
+    el.addEventListener('click', () => this.selectLane(lane));
+    wave.addEventListener(
+      'wheel',
+      (e) => {
+        if (this.selectedLane === lane) this.onWheel(e, wave, lane);
+        else if (e.shiftKey || Math.abs(e.deltaX) > Math.abs(e.deltaY)) this.onWheel(e, wave, lane.ownView ? lane : undefined);
+      },
+      { passive: false },
+    );
+    let dragFromH: number | null = null;
+    resizeHandle.addEventListener('selectstart', (e) => e.preventDefault());
+    resizeHandle.addEventListener('dragstart', (e) => e.preventDefault());
+    resizeHandle.addEventListener('mousedown', noNativeDrag);
+    resizeHandle.addEventListener('pointerdown', (e) => {
+      resizeHandle.setPointerCapture(e.pointerId);
+      dragFromH = wave.clientHeight - e.clientY;
+    });
+    resizeHandle.addEventListener('pointermove', (e) => {
+      if (dragFromH == null) return;
+      wave.style.height = `${Math.max(this.laneMinH(), Math.min(500, dragFromH + e.clientY))}px`;
+      this.dirty = true;
+    });
+    resizeHandle.addEventListener('pointerup', () => {
+      if (dragFromH == null) return;
+      dragFromH = null;
+      lane.height = wave.clientHeight;
+      this.emit();
+    });
+    resizeHandle.ondblclick = () => {
+      wave.style.height = '';
+      lane.height = undefined;
+      this.dirty = true;
+      this.emit();
+    };
+    pressed(mute, false);
+    pressed(solo, false);
+    return lane;
+  }
+
+  /** Every lane that holds live-recorded takes (e.g. one for bass, one for guitar). */
+  private findRecordGroups() {
+    return this.lanes.filter((l) => l.recordGroup);
+  }
+
+  /** How many takes to keep per recording (oldest dropped first past this); a global preference, set in the Live input drawer. */
+  private maxTakes(): number {
+    try {
+      const v = Number(localStorage.getItem('steminize.maxTakes'));
+      if (Number.isFinite(v) && v >= 1) return Math.min(20, Math.round(v));
+    } catch {
+      /* ignore */
+    }
+    return 5;
+  }
+
+  /** Starts drawing a live waveform for a new take in progress. Pass an existing take-group lane
+   * to add another take to it (e.g. a second bass take); omit it to start a new named group (e.g.
+   * switching to guitar) — its mixer slot is created once and reused by every take put into it,
+   * only the active one is ever actually in the mix. finishRecordLane() turns the draft into a
+   * real take once it's stopped; this is just visual feedback that it's actually picking up
+   * signal, so it doesn't touch the group's own name (set once, renameable like any track). */
+  private beginRecordLane(target?: Lane) {
+    if (!this.r) return;
+    const bucketCount = Math.max(1, Math.ceil(this.length / FINE));
+    let lane = target;
+    if (!lane) {
+      const data: Stereo = [new Float32Array(this.length), new Float32Array(this.length)];
+      lane = this.buildLane({ name: `Track ${this.findRecordGroups().length + 1}`, data }, this.lanes.length, '#ef4444');
+      lane.recordGroup = true;
+      lane.groupId = Math.random().toString(36).slice(2, 10);
+      lane.takes = [];
+      this.lanes.push(lane);
+      this.player.addTrack(data);
+      this.player.setGains(this.gains(), this.pans(), this.eqs());
+    } else {
+      lane.data = [new Float32Array(this.length), new Float32Array(this.length)];
+    }
+    lane.peaks = new Float32Array(bucketCount);
+    lane.el.classList.add('recording');
+    this.recordLane = lane;
+    this.recordStartPos = this.player.state.pos;
+    // Grows by wall-clock time, not the playhead: recording works whether or not the song is
+    // actually playing, so tying live drawing to a possibly-stationary playhead could leave it
+    // updating a single bucket in place instead of visibly filling in left to right.
+    const wallStart = performance.now();
+    this.recordDrawTimer = window.setInterval(() => {
+      const l = this.recordLane;
+      if (!l) return;
+      const elapsedFrames = Math.round(((performance.now() - wallStart) / 1000) * SR);
+      const bucket = Math.floor((this.recordStartPos + elapsedFrames) / FINE);
+      if (bucket >= 0 && bucket < l.peaks.length) {
+        // A live meter reading is usually well under the amplitude the shared display scale
+        // expects (calibrated off the separated stems), so boost it a bit here purely for
+        // visibility; it has no bearing on the real, accurate peaks computed after stopping.
+        l.peaks[bucket] = Math.max(l.peaks[bucket], Math.min(1, this.player.monitorLevel() * 2.5));
+        l.layers = undefined;
+        this.dirty = true;
+      }
+    }, 80);
+  }
+
+  /** Stops the live waveform drawing and, given the finished recording (or null if there was
+   * nothing to keep), decodes it, places it in the song at the frame position recording started
+   * at, and adds it as a new take — selected, saved, and mixed in at the group's one slot. */
+  private async finishRecordLane(rec: { blob?: Blob; native?: { samples: Float32Array; startPos: number } } | null) {
+    const blob = rec?.blob ?? null;
+    const native = rec?.native ?? null;
+    clearInterval(this.recordDrawTimer);
+    const lane = this.recordLane;
+    this.recordLane = null;
+    const punchEnd = this.recordPunchEnd;
+    this.recordPunchEnd = null;
+    if (!lane) return;
+    lane.el.classList.remove('recording');
+    const takes = lane.takes ?? [];
+    if (!blob && !native) {
+      if (takes.length) this.selectTake(lane, takes[takes.length - 1]);
+      else {
+        lane.el.remove();
+        this.lanes.splice(this.lanes.indexOf(lane), 1);
+      }
+      return;
+    }
+    try {
+      let raw: Stereo;
+      let at: ReturnType<typeof placeTake>;
+      if (native) {
+        // The native engine already placed it: the start frame has the round trip taken off.
+        raw = [native.samples, native.samples];
+        at = placeTake(raw[0].length, Math.round(native.startPos), 0, this.length, punchEnd);
+      } else {
+        const ctx = new OfflineAudioContext(2, 1, SR);
+        const audio = await ctx.decodeAudioData(await blob!.arrayBuffer());
+        const ch = (i: number) => audio.getChannelData(Math.min(i, audio.numberOfChannels - 1));
+        raw = [ch(0), ch(1)];
+        // The take lands behind the song by the round-trip audio delay; put it back where it was played.
+        at = placeTake(raw[0].length, this.recordStartPos, Math.round((loadRecLatencyMs() / 1000) * SR), this.length, punchEnd);
+      }
+      const data: Stereo = [new Float32Array(this.length), new Float32Array(this.length)];
+      if (at.count > 0) {
+        data[0].set(raw[0].subarray(at.srcStart, at.srcStart + at.count), at.dstStart);
+        data[1].set(raw[1].subarray(at.srcStart, at.srcStart + at.count), at.dstStart);
+      }
+      const take: Take = { id: `take-${takes.length + 1}`, data, peaks: peaksOf(data), native: !!native };
+      lane.takes = [...takes, take];
+      if (takes.length === 0) {
+        lane.colour = stemColour('take', this.lanes.indexOf(lane));
+        lane.el.style.setProperty('--c', lane.colour);
+      }
+      // Oldest take(s) first, once there are more than the "Keep last" setting allows.
+      const cap = this.maxTakes();
+      const dropped: Take[] = [];
+      while (lane.takes.length > cap) dropped.push(lane.takes.shift()!);
+      this.selectTake(lane, take);
+      this.refreshTunerSources();
+      await this.onTakeAdded(lane.groupId!, { id: take.id, data: take.data });
+      for (const d of dropped) await this.onTakeRemoved(lane.groupId!, d.id).catch(() => {});
+      toast(dropped.length ? `${take.id} added (dropped ${dropped.map((d) => d.id).join(', ')})` : `${take.id} added`);
+    } catch (e) {
+      if (takes.length) this.selectTake(lane, takes[takes.length - 1]);
+      else {
+        lane.el.remove();
+        this.lanes.splice(this.lanes.indexOf(lane), 1);
+      }
+      toast(`Couldn't add the recording: ${(e as Error).message}`, true);
+    }
+  }
+
+  /** Makes `take` the active, audible one for its take-group lane: swaps the displayed waveform
+   * and the mixer's audio at that one shared slot, and rebuilds the collapsed-takes strip. */
+  private selectTake(lane: Lane, take: Take) {
+    lane.activeTakeId = take.id;
+    lane.data = take.data;
+    lane.peaks = take.peaks;
+    lane.layers = undefined;
+    const badge = lane.el.querySelector('.take-badge');
+    if (badge) badge.textContent = (lane.takes?.length ?? 0) > 1 ? ` · ${take.id}` : '';
+    this.laneScale = 1 / Math.max(1e-3, ...this.lanes.flatMap((l) => Math.max(...l.peaks)));
+    this.player.replaceTrack(this.lanes.indexOf(lane), take.data);
+    this.renderTakeStrip(lane);
+    this.dirty = true;
+    this.emit();
+  }
+
+  /** The row of other takes for a lane, below its main controls: click one to switch to it, or delete it. */
+  /** A click-to-edit note button for one take, reused for both the active take's row and the collapsed others. */
+  private takeNoteEditor(lane: Lane, t: Take): HTMLElement {
+    const val = t.note ?? '';
+    const btn = h('button', { class: 'take-note', type: 'button', title: val || 'Add a note' }, val || '+ note');
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      const input = h('input', { type: 'text', class: 'take-note-edit', value: val, placeholder: 'Note…', maxLength: 80 } as any);
+      const finish = (save: boolean) => {
+        if (save && input.value.trim() !== (t.note ?? '')) {
+          t.note = input.value.trim() || undefined;
+          this.onTakeNoteChanged(lane.groupId!, t.id, t.note ?? '');
+        }
+        input.replaceWith(this.takeNoteEditor(lane, t));
+      };
+      input.onclick = (e2) => e2.stopPropagation();
+      input.onkeydown = (e2) => {
+        e2.stopPropagation();
+        if (e2.key === 'Enter') finish(true);
+        if (e2.key === 'Escape') finish(false);
+      };
+      input.onblur = () => finish(true);
+      btn.replaceWith(input);
+      input.focus();
+      input.select();
+    };
+    return btn;
+  }
+
+  /** Every take for a lane, one row each: the active one first (no switch/delete, just its note),
+   * then the others (click to switch, × to delete). Notes are editable on any of them. */
+  private renderTakeStrip(lane: Lane) {
+    const takes = lane.takes ?? [];
+    if (!takes.length) {
+      lane.takesEl?.remove();
+      lane.takesEl = undefined;
+      return;
+    }
+    lane.takesEl ??= h('div', { class: 'take-strip' });
+    if (!lane.takesEl.isConnected) lane.el.insertBefore(lane.takesEl, lane.el.lastElementChild);
+    lane.takesEl.replaceChildren(
+      ...takes.map((t) => {
+        const active = t.id === lane.activeTakeId;
+        if (active) {
+          return h('div', { class: 'take-block' }, h('div', { class: 'take-row active' }, h('span', { class: 'take-chip current' }, t.id), this.takeNoteEditor(lane, t)), this.takeNudger(lane, t));
+        }
+        const switchBtn = h('button', { class: 'take-chip', type: 'button', title: `Switch to ${t.id}` }, t.id);
+        switchBtn.onclick = () => {
+          this.selectTake(lane, t);
+          this.onTakeSelected(lane.groupId!, t.id);
+        };
+        const del = h('button', { class: 'take-del', type: 'button', title: `Delete ${t.id}` }, '×');
+        del.onclick = (e) => {
+          e.stopPropagation();
+          void this.deleteTake(lane, t);
+        };
+        return h('div', { class: 'take-row' }, switchBtn, this.takeNoteEditor(lane, t), del);
+      }),
+    );
+  }
+
+  /** "Line up": for headphone players who can't Measure. Slide the take earlier/later against the click or song until it feels right, then keep that as the latency for every future take. */
+  private takeNudger(lane: Lane, t: Take): HTMLElement {
+    const net = Math.round(t.nudgeMs ?? 0);
+    const step = (label: string, ms: number) => {
+      const b = h('button', { class: 'btn tiny ghost', type: 'button', title: `Move this take ${ms < 0 ? 'earlier' : 'later'} by ${Math.abs(ms)} ms` }, label);
+      b.onclick = () => this.nudgeTake(lane, t, ms);
+      return b;
+    };
+    const use = h('button', { class: 'btn tiny', type: 'button', disabled: net === 0, title: 'Use this shift as your latency, so every take you record from now on lands where this one now sits' }, 'Use as latency');
+    use.onclick = () => {
+      const native = !!t.native;
+      const next = Math.max(0, Math.min(MAX_REC_LATENCY_MS, loadRecLatencyMs(native) - net));
+      this.setRecLatency(next, native);
+      t.nudgeMs = 0;
+      this.renderTakeStrip(lane);
+      toast(`Latency is now ${next} ms`);
+    };
+    const readout = h('span', { class: 'muted small take-nudge-ms' }, net === 0 ? 'in place' : `${net < 0 ? 'earlier' : 'later'} by ${Math.abs(net)} ms`);
+    return h(
+      'div',
+      { class: 'take-nudge', title: 'Played with headphones and no loopback cable? Record against the click, then zoom in on its waveform until the teal beat lines show, slide the take until your note starts sit on them, then press Use as latency.' },
+      h('span', { class: 'muted small' }, 'Line up'),
+      step('« 10', -10),
+      step('‹ 1', -1),
+      step('1 ›', 1),
+      step('10 »', 10),
+      readout,
+      use,
+    );
+  }
+
+  /** Moves a take's audio by `ms`, updates what is heard and drawn, and saves it again shortly after the last nudge. */
+  private nudgeTake(lane: Lane, t: Take, ms: number) {
+    t.data = shiftTake(t.data, Math.round((ms / 1000) * SR)) as Stereo;
+    t.peaks = peaksOf(t.data);
+    t.nudgeMs = (t.nudgeMs ?? 0) + ms;
+    this.selectTake(lane, t);
+    this.refreshTunerSources();
+    const libId = this.current?.libId;
+    const groupId = lane.groupId;
+    if (!groupId) return;
+    clearTimeout(this.nudgeSaveTimers.get(t));
+    this.nudgeSaveTimers.set(
+      t,
+      window.setTimeout(() => {
+        this.nudgeSaveTimers.delete(t);
+        void this.onTakeReplaced(libId, groupId, { id: t.id, data: t.data, note: t.note }).catch((e) => toast(`Couldn't save the moved take: ${(e as Error).message}`, true));
+      }, 800),
+    );
+  }
+
+  private async deleteTake(lane: Lane, take: Take) {
+    if (!confirm(`Delete ${take.id}? This can't be undone.`)) return;
+    lane.takes = (lane.takes ?? []).filter((t) => t.id !== take.id);
+    this.renderTakeStrip(lane);
+    try {
+      await this.onTakeRemoved(lane.groupId!, take.id);
+    } catch (e) {
+      toast(`Couldn't delete ${take.id}: ${(e as Error).message}`, true);
+    }
+    if (!lane.takes.length) {
+      // Nothing left at this slot. There's no message to remove a track from the player outright,
+      // so silence it in place (a zeroed stem is inaudible either way) and drop its row.
+      this.player.replaceTrack(this.lanes.indexOf(lane), [new Float32Array(this.length), new Float32Array(this.length)]);
+      lane.takesEl?.remove();
+      lane.el.remove();
+      this.lanes.splice(this.lanes.indexOf(lane), 1);
+      this.player.setGains(this.gains(), this.pans(), this.eqs());
+      this.refreshRecordTargetsUi();
+      this.dirty = true;
+      this.emit();
+    }
+  }
+
+  /** Rebuilds the take-group lane from takes loaded off the library (if any), same shape as a
+   * live recording produces: one lane, one mixer slot, the saved active take selected. Appended
+   * after the stem lanes, same as a live recording would be, so a saved DeckState's per-lane
+   * settings (indexed positionally) still line up with the right lane on reopen. */
+  private restoreTakes(r: Result) {
+    if (!r.takeGroups?.length) return;
+    for (const g of r.takeGroups) {
+      if (!g.takes.length) continue;
+      const placeholder: Stereo = [new Float32Array(this.length), new Float32Array(this.length)];
+      const lane = this.buildLane({ name: `Track ${this.findRecordGroups().length + 1}`, data: placeholder }, this.lanes.length, '#ef4444');
+      lane.recordGroup = true;
+      lane.groupId = g.id;
+      const takes: Take[] = g.takes.map((t) => ({ id: t.id, data: t.data, peaks: peaksOf(t.data), note: t.note }));
+      const active = takes.find((t) => t.id === g.activeTake) ?? takes[takes.length - 1];
+      // The "Keep last" cap may have been lowered since these were saved: trim down to it now,
+      // oldest first, but never the one that's actually selected.
+      const cap = this.maxTakes();
+      const dropped: Take[] = [];
+      while (takes.length > cap) {
+        const i = takes.findIndex((t) => t !== active);
+        if (i < 0) break;
+        dropped.push(takes.splice(i, 1)[0]);
+      }
+      lane.takes = takes;
+      this.lanes.push(lane);
+      this.player.addTrack(placeholder);
+      this.selectTake(lane, active);
+      for (const d of dropped) void this.onTakeRemoved(g.id, d.id).catch(() => {});
+    }
+    this.refreshRecordTargetsUi();
+  }
+
+  open(r: Result, state?: DeckState) {
+    this.stopLiveInputUi();
+    this.quiet = true;
+    this.player.pause();
+    this.r = r;
+    this.loop = { on: false, a: 0, b: 0 };
+    this.pr = { ...structuredClone(DEFAULT_PR), beatMode: loadBeatMode() };
+    this.tempo = 1;
+    this.pitch = 0;
+    $('welcome').hidden = true;
+    $('deck').hidden = false;
+    // Only now, not at construction: before a song is open, #deck (and everything in it, including
+    // a floating Scratchpad) is display:none, so it has no measurable size/position to restore into.
+    this.restoreScratchFloat();
+    this.setTitleText(r.title);
+    this.media.setSong(r.title);
+    this.updateLyricsLink();
+    const s = r.settings;
+    const extras =
+      r.kind === 'multitrack'
+        ? [`multitrack · ${r.stems.length} tracks`]
+        : [r.took ? `separated in ${fmtDuration(r.took)}` : '', MODELS[s.model].label, s.shifts > 1 ? `${s.shifts} shifts` : '', s.precision === 'full' ? 'full precision' : ''];
+    $('rerunBtn').hidden = r.kind === 'multitrack';
+    $('trackMeta').textContent = [fmtTime(r.seconds), ...extras].filter(Boolean).join(' · ');
+    $('timeTotal').textContent = fmtTime(r.seconds);
+
+    this.overviewPeaks = peaksOf(r.stems.flatMap((s) => s.data));
+    this.overviewScale = 1 / Math.max(1e-3, ...this.overviewPeaks);
+    this.markers = [];
+    this.view = { start: 0, end: r.stems[0].data[0].length };
+    // Normalise display to the loudest stem so quiet stems are still visible.
+    const lanes = $('lanes');
+    lanes.replaceChildren();
+    this.selectedLane = null;
+    this.laneUndo = [];
+    this.laneRedo = [];
+    this.fadeMul = 1;
+    this.fadeToken++; // cancels any fade still animating from the song just left
+    this.practiceSeconds = 0;
+    this.lastPracticed = undefined;
+    this.lastPracticeTick = null;
+    this.lanes = r.stems.map((s, i) => this.buildLane(s, i));
+    this.player.load(r.stems.map((s) => s.data), this.gains(), r.libId);
+    this.restoreTakes(r);
+    if (state) this.applyState(state); // restores practiceSeconds/lastPracticed too, if saved
+    this.refreshTunerSources();
+    this.setTempoPitch(this.tempo, this.pitch, false);
+    this.player.setLoop(this.loop.on, this.loop.a, this.loop.b);
+    this.updateLoopUi();
+    this.laneScale = 1 / Math.max(1e-3, ...this.lanes.flatMap((l) => Math.max(...l.peaks)));
+    this.syncPracticeUi();
+    this.renderMarkers();
+    this.setView(0, this.length);
+    this.setAnalysis(r.analysis);
+    this.tx.open(r, state?.tx);
+    this.applyScratch(state?.scratch);
+    this.invalidateLayers();
+    this.quiet = false;
+    this.practicePanel?.render();
+  }
+
+  /** Accumulates practice time while actually playing (not just open/paused), throttling the
+   * resulting emit() (which rebuilds and saves the whole DeckState) to once per whole second, not
+   * every playback tick. A gap over 5s (tab backgrounded, debugger pause, ...) isn't counted, so
+   * time away doesn't get credited as practice. */
+  private trackPractice(playing: boolean) {
+    if (!playing) {
+      this.lastPracticeTick = null;
+      return;
+    }
+    const now = performance.now();
+    if (this.lastPracticeTick !== null) {
+      const delta = (now - this.lastPracticeTick) / 1000;
+      if (delta > 0 && delta < 5) {
+        const before = Math.floor(this.practiceSeconds);
+        this.practiceSeconds += delta;
+        this.lastPracticed = Date.now();
+        if (Math.floor(this.practiceSeconds) !== before) this.emit();
+      }
+    }
+    this.lastPracticeTick = now;
+  }
+
+  // ---------- saved state ----------
+  getState(): DeckState {
+    return {
+      masterVolume: this.masterVolume,
+      lanes: this.lanes.map((l) => ({ vol: l.vol, pan: l.pan, mute: l.mute, solo: l.solo, eq: l.eq, height: l.height, label: l.label })),
+      loop: { ...this.loop },
+      tempo: this.tempo,
+      pitch: this.pitch,
+      practice: structuredClone({ ...this.pr, trainer: { ...this.pr.trainer, on: false } }),
+      markers: this.markers.map((m) => ({ ...m })),
+      tx: this.tx.getState(),
+      scratch: { ...this.scratch },
+      practiceSeconds: this.practiceSeconds,
+      lastPracticed: this.lastPracticed,
+    };
+  }
+
+  private applyState(s: DeckState) {
+    this.setMasterVolume(s.masterVolume ?? 0.9);
+    this.pr = { ...structuredClone(DEFAULT_PR), ...s.practice, trainer: { ...DEFAULT_PR.trainer, ...s.practice?.trainer, on: false } };
+    this.pr.beatMode = s.practice?.beatMode === 'manual' ? 'manual' : s.practice?.beatMode === 'auto' ? 'auto' : loadBeatMode();
+    this.pr.manualBpm = boundedBpm(this.pr.manualBpm);
+    this.pr.manualOffset = Math.max(0, Math.min(this.length / SR, Number.isFinite(this.pr.manualOffset) ? this.pr.manualOffset : 0));
+    this.tempo = s.tempo ?? 1;
+    this.pitch = s.pitch ?? 0;
+    this.practiceSeconds = s.practiceSeconds ?? 0;
+    this.lastPracticed = s.lastPracticed;
+    this.loop = { ...this.loop, ...s.loop };
+    this.markers = (s.markers ?? []).map((m) => ({ ...m })).sort((a, b) => a.pos - b.pos);
+    s.lanes?.forEach((st, i) => {
+      const l = this.lanes[i];
+      if (!l) return;
+      Object.assign(l, st);
+      (l.el.querySelectorAll('input[type=range]')[0] as HTMLInputElement).value = String(l.vol);
+      const pan = l.el.querySelectorAll('input[type=range]')[1] as HTMLInputElement;
+      pan.value = String(l.pan);
+      pan.dispatchEvent(new Event('input'));
+      if (l.height) (l.el.querySelector('.wave') as HTMLElement).style.height = `${Math.max(l.height, this.laneMinH())}px`;
+      if (l.label) {
+        const nameBtn = l.el.querySelector('.name')!;
+        const badgeText = nameBtn.querySelector('.take-badge')?.textContent ?? '';
+        nameBtn.replaceChildren(laneLabel(l), h('span', { class: 'take-badge muted' }, badgeText));
+        (l.el.querySelector('.dl') as HTMLElement).title = `Save ${laneLabel(l)}`;
+      }
+    });
+    for (const l of this.lanes) this.setLane(l, {});
+  }
+
+  private emit() {
+    this.practicePanel?.render();
+    if (this.r && !this.quiet) this.onStateChange(this.getState());
+  }
+
+  // ---------- tempo analysis & practice tools ----------
+  setAnalysis(a?: Analysis) {
+    if (this.r) this.r.analysis = a;
+    $('deck').classList.toggle('no-beats', !this.beatSeconds().length);
+    this.updateBpmInfo();
+    this.sendPractice();
+    this.invalidateLayers();
+    this.practicePanel?.render();
+  }
+
+  private beatFrames() {
+    return this.beatSeconds().map((s) => Math.round(s * SR));
+  }
+
+  private downbeat() {
+    if (this.pr.beatMode === 'manual') return this.pr.barShift;
+    const a = this.r?.analysis;
+    return a ? (((a.downbeat + this.pr.barShift) % this.pr.perBar) + this.pr.perBar) % this.pr.perBar : 0;
+  }
+
+  /** The native engine's sound device was lost: carry on in the webview engine, from the same place, with the same tracks and settings. */
+  private fallbackToWeb() {
+    // A take that was being recorded can't be saved: the engine holding it is gone.
+    if (this.recordLane) {
+      void this.finishRecordLane(null);
+      toast('The take in progress was lost with the audio device.', true);
+    }
+    this.stopLiveInputUi();
+    if (!this.r) return;
+    const pos = this.player.state.pos;
+    this.player.load(this.r.stems.map((s) => s.data), this.gains()); // no library id: the web engine
+    for (const l of this.lanes.slice(this.r.stems.length)) this.player.addTrack(l.data);
+    this.player.setGains(this.gains(), this.pans(), this.eqs());
+    this.setTempoPitch(this.tempo, this.pitch, false);
+    this.player.setLoop(this.loop.on, this.loop.a, this.loop.b);
+    this.sendPractice();
+    this.player.seek(pos);
+  }
+
+  private sendPractice() {
+    const p = this.pr;
+    this.player.setPractice({
+      gap: p.gap,
+      countIn: p.countIn,
+      perBar: p.perBar,
+      beats: this.beatFrames(),
+      downbeat: this.downbeat(),
+      click: p.click,
+      clickVol: p.clickVol,
+      trainer: { ...p.trainer },
+    });
+  }
+
+  private updateBpmInfo(analysing = false) {
+    this.updateKeyInfo();
+    this.updateDrawerSummary();
+    const a = this.r?.analysis;
+    const el = $('bpmInfo');
+    if (this.pr.beatMode === 'manual') { el.textContent = `${this.pr.manualBpm} BPM · 手動`; return; }
+    if (analysing) el.textContent = 'Tempo: analysing…';
+    else if (!a?.beats.length) el.textContent = this.r ? 'Tempo: analysing…' : 'Tempo: –';
+    else {
+      const now = Math.round(a.bpm * this.tempo);
+      el.textContent = `${Math.round(a.bpm)} BPM${this.tempo !== 1 ? ` (${now} at this speed)` : ''}`;
+    }
+  }
+
+  private updateKeyInfo() {
+    const k = this.r?.analysis?.key;
+    const el = $('keyInfo');
+    el.hidden = !k;
+    if (!k) {
+      $('keyPanel').hidden = true;
+      return;
+    }
+    const unsure = !k.manual && k.confidence < 0.05 ? ' (unsure)' : '';
+    const set = k.manual ? ' ✓' : '';
+    el.textContent = (this.pitch ? `Key ${keyName(k)} → ${keyName(k, this.pitch)}` : `Key ${keyName(k)}`) + unsure + set;
+    el.title = 'Click to recheck or change the key';
+    this.updateDrawerSummary();
+  }
+
+  // ---------- key panel ----------
+  private initKeyPanel() {
+    const panel = $('keyPanel');
+    const tonic = $<HTMLSelectElement>('keyTonic');
+    const mode = $<HTMLSelectElement>('keyMode');
+    const names = ['C', 'C♯ / D♭', 'D', 'E♭', 'E', 'F', 'F♯ / G♭', 'G', 'A♭', 'A', 'B♭', 'B'];
+    tonic.replaceChildren(...names.map((n, i) => h('option', { value: String(i) }, n)));
+    $('keyInfo').onclick = () => {
+      panel.hidden = !panel.hidden;
+      if (!panel.hidden) void this.showKeyCandidates();
+    };
+    $('keyClose').onclick = () => (panel.hidden = true);
+    $('keySection').onclick = () => {
+      const r = this.range();
+      void this.showKeyCandidates(r?.[0], r?.[1]);
+    };
+    $('keyWhole').onclick = () => void this.showKeyCandidates();
+    $('keySet').onclick = () => this.setKey({ tonic: Number(tonic.value), mode: mode.value as 'major' | 'minor', confidence: 1, manual: true });
+  }
+
+  /** The loop if one is on, otherwise the current marked section. */
+  private range(): [number, number, string] | undefined {
+    if (this.loop.on && this.loop.b > this.loop.a) return [this.loop.a, this.loop.b, 'the loop'];
+    const i = this.sectionAt(this.player.state.pos);
+    if (i >= 0) return [this.markers[i].pos, this.markers[i + 1]?.pos ?? this.length, `“${this.markers[i].name}”`];
+    return undefined;
+  }
+
+  private async showKeyCandidates(start?: number, end?: number) {
+    const r = this.r;
+    if (!r) return;
+    const list = $('keyList');
+    const where = start != null ? (this.range()?.[2] ?? 'this part') : 'the whole song';
+    $('keyWhere').textContent = `Checking ${where}…`;
+    list.replaceChildren();
+    this.keyPartial = start != null;
+    this.refreshKeySectionBtn();
+    $('keyWhole').hidden = start == null;
+    const cur = r.analysis?.key;
+    if (cur) {
+      $<HTMLSelectElement>('keyTonic').value = String(cur.tonic);
+      $<HTMLSelectElement>('keyMode').value = cur.mode;
+    }
+    try {
+      const c = await this.rankKeys(r, start, end);
+      if (this.r !== r) return;
+      const top = c[0]?.score ?? 1;
+      $('keyWhere').textContent = `Best matches for ${where}:`;
+      list.replaceChildren(
+        ...c.slice(0, 5).map((k) => {
+          const pct = Math.max(0, Math.round((k.score / top) * 100));
+          const isCur = cur && cur.tonic === k.tonic && cur.mode === k.mode;
+          const b = h('button', { class: `eq-chip${isCur ? ' cur' : ''}`, type: 'button', title: `Fit ${pct}% of the best match` }, `${keyName(k)} · ${pct}%`);
+          b.onclick = () => this.setKey({ tonic: k.tonic, mode: k.mode, confidence: Math.round((k.score - (c[1]?.score ?? 0)) * 1000) / 1000, manual: true });
+          return b;
+        }),
+      );
+    } catch (e) {
+      $('keyWhere').textContent = `Couldn't check the key: ${(e as Error).message}`;
+    }
+  }
+
+  private keyPartial = false;
+  /** Show "Check <loop/section> only" when there is one (kept current as loops and markers change). */
+  private refreshKeySectionBtn() {
+    const btn = $('keySection');
+    const rng = this.range();
+    btn.hidden = !rng || this.keyPartial;
+    if (rng) btn.textContent = `Check ${rng[2]} only`;
+  }
+
+  private setKey(k: KeyResult) {
+    const r = this.r;
+    if (!r?.analysis) return;
+    r.analysis = { ...r.analysis, key: k };
+    this.updateKeyInfo();
+    this.onAnalysisChange(r);
+    for (const b of $('keyList').querySelectorAll('button')) b.classList.toggle('cur', b.textContent?.startsWith(keyName(k) + ' ') ?? false);
+    toast(`Key set to ${keyName(k)}`);
+  }
+
+  private updateTrainerInfo(passes: number, countingIn: boolean) {
+    const t = this.pr.trainer;
+    const gate = t.on && t.gate ? ` · ${!this.scratch.tabTrainer ? 'turn on the tab Trainer (and Live input) to judge passes' : this.gateStatus || `needs ${Math.round(t.gate * 100)}% to speed up`}` : '';
+    $('trainerInfo').textContent = t.on
+      ? `${countingIn ? 'Count-in… · ' : ''}Pass ${passes + 1} at ${Math.round(this.tempo * 100)}%${this.tempo >= t.to ? ' (target reached)' : ''}${gate}`
+      : countingIn
+        ? 'Count-in…'
+        : '';
+  }
+
+  private syncPracticeUi() {
+    const p = this.pr;
+    pressed($('trainerBtn'), p.trainer.on);
+    pressed($('countInBtn'), p.countIn);
+    pressed($('clickBtn'), p.click);
+    $<HTMLInputElement>('clickVol').value = String(p.clickVol);
+    $<HTMLSelectElement>('gap').value = String(p.gap);
+    $<HTMLSelectElement>('perBar').value = String(p.perBar);
+    $<HTMLSelectElement>('snap').value = p.snap;
+    $<HTMLInputElement>('trFrom').value = String(Math.round(p.trainer.from * 100));
+    $<HTMLInputElement>('trTo').value = String(Math.round(p.trainer.to * 100));
+    $<HTMLInputElement>('trStep').value = String(Math.round(p.trainer.step * 100));
+    $<HTMLInputElement>('trEvery').value = String(p.trainer.every);
+    $<HTMLInputElement>('trGate').checked = !!p.trainer.gate;
+    $<HTMLInputElement>('trGateAcc').value = String(Math.round((p.trainer.gate || 0.9) * 100));
+    this.updateTrainerInfo(0, false);
+    this.updateBpmInfo();
+    this.updateDrawerSummary();
+  }
+
+  // ---------- live input: a real instrument or mic, played live alongside the tracks ----------
+  private initLiveInput() {
+    if (!navigator.mediaDevices?.getUserMedia) return; // liveTab stays hidden: not available here
+    $('liveTab').hidden = false;
+    const btn = $<HTMLButtonElement>('liveBtn');
+    const deviceSel = $<HTMLSelectElement>('liveDevice');
+    const channelSel = $<HTMLSelectElement>('liveChannel');
+    channelSel.value = loadLiveChannel();
+    const vol = $<HTMLInputElement>('liveVol');
+    const volWrap = $('liveVolWrap');
+    const pan = $<HTMLInputElement>('livePan');
+    const panWrap = $('livePanWrap');
+    const panOut = $('livePanOut');
+    const meter = $('liveMeter');
+    const meterBar = $('liveMeterBar');
+    const recordTarget = $<HTMLSelectElement>('liveRecordTarget');
+    const recordBtn = $<HTMLButtonElement>('liveRecordBtn');
+    const recordTime = $('liveRecordTime');
+    const status = $('liveStatus');
+    const latencyWrap = $('liveLatencyWrap');
+    const punchWrap = $('livePunchWrap');
+    const punchBox = $<HTMLInputElement>('livePunch');
+    const latencyInput = $<HTMLInputElement>('liveLatency');
+    const latencyBtn = $<HTMLButtonElement>('liveLatencyBtn');
+    const sum = $('sumLive');
+
+    // The box shows the value for whichever engine the input is running in (the native engine's is a few ms, the webview's hundreds).
+    const applyLatency = (ms: number, native = this.player.monitorIsNative) => {
+      const v = Math.max(0, Math.min(MAX_REC_LATENCY_MS, Math.round(ms) || 0));
+      if (native === this.player.monitorIsNative) latencyInput.value = String(v);
+      saveRecLatencyMs(v, native);
+    };
+    this.setRecLatency = applyLatency;
+    const showLatency = () => (latencyInput.value = String(loadRecLatencyMs(this.player.monitorIsNative)));
+    showLatency();
+    latencyInput.onchange = () => applyLatency(Number(latencyInput.value));
+    latencyBtn.onclick = async () => {
+      if (!this.player.monitoring || this.player.recording) return;
+      latencyBtn.disabled = true;
+      recordBtn.disabled = true;
+      status.textContent = 'Measuring… clicks will play through your speakers. Keep the room quiet.';
+      try {
+        const r = await this.player.measureLatency();
+        if (r) {
+          applyLatency(r.ms);
+          status.textContent = `Measured ${r.ms} ms (${r.hits} of ${r.total} clicks). Takes are now shifted earlier by that much.`;
+        } else {
+          status.textContent = "Couldn't hear the clicks. Turn the volume up and put the microphone near the speakers, or connect the output to the input with a cable. Headphones won't work.";
+        }
+      } catch (e) {
+        status.textContent = `Couldn't measure: ${(e as Error).message}`;
+      } finally {
+        latencyBtn.disabled = false;
+        recordBtn.disabled = false;
+      }
+    };
+
+    const lowLat = $<HTMLInputElement>('liveLowLat');
+    lowLat.checked = loadLowLatencyAudio();
+    lowLat.onchange = () => {
+      saveLowLatencyAudio(lowLat.checked);
+      status.textContent = lowLat.checked ? 'Low-latency audio will be used the next time you open Steminize.' : 'Standard audio buffers will be used the next time you open Steminize.';
+    };
+
+    const maxTakesInput = $<HTMLInputElement>('liveMaxTakes');
+    maxTakesInput.value = String(this.maxTakes());
+    maxTakesInput.onchange = () => {
+      const v = Math.max(1, Math.min(20, Math.round(Number(maxTakesInput.value)) || 5));
+      maxTakesInput.value = String(v);
+      try {
+        localStorage.setItem('steminize.maxTakes', String(v));
+      } catch {
+        /* ignore */
+      }
+      // Apply immediately to every recording (bass, guitar, ...) that already has more takes than the new cap allows.
+      for (const lane of this.findRecordGroups()) {
+        if (!lane.takes) continue;
+        const active = lane.takes.find((t) => t.id === lane.activeTakeId);
+        while (lane.takes.length > v) {
+          const i = lane.takes.findIndex((t) => t !== active);
+          if (i < 0) break;
+          const [dropped] = lane.takes.splice(i, 1);
+          void this.onTakeRemoved(lane.groupId!, dropped.id).catch(() => {});
+        }
+        this.renderTakeStrip(lane);
+      }
+    };
+
+    const refreshRecordTargets = () => {
+      const groups = this.findRecordGroups();
+      recordTarget.hidden = groups.length === 0;
+      const current = recordTarget.value;
+      recordTarget.replaceChildren(...groups.map((l) => h('option', { value: String(this.lanes.indexOf(l)) }, laneLabel(l))), h('option', { value: 'new' }, '+ New track'));
+      if ([...recordTarget.options].some((o) => o.value === current)) recordTarget.value = current;
+    };
+    this.refreshRecordTargetsUi = refreshRecordTargets;
+    refreshRecordTargets();
+
+    const refreshDevices = async () => {
+      const inputs = await this.player.listInputs();
+      const current = deviceSel.value;
+      deviceSel.replaceChildren(...inputs.map((d, i) => h('option', { value: d.deviceId }, d.label || `Input ${i + 1}`)));
+      if (inputs.some((d) => d.deviceId === current)) deviceSel.value = current;
+      deviceSel.hidden = inputs.length < 2;
+    };
+    navigator.mediaDevices.addEventListener?.('devicechange', () => {
+      if (this.player.monitoring) void refreshDevices();
+    });
+
+    let meterTimer = 0;
+    const meterTick = () => {
+      if (!this.player.monitoring) return;
+      meterBar.style.width = `${Math.round(this.player.monitorLevel() * 100)}%`;
+      meterTimer = requestAnimationFrame(meterTick);
+    };
+
+    const setUi = (on: boolean) => {
+      pressed(btn, on);
+      btn.textContent = on ? 'Stop' : 'Monitor';
+      volWrap.hidden = !on;
+      channelSel.hidden = !on;
+      panWrap.hidden = !on;
+      meter.hidden = !on;
+      recordBtn.hidden = !on;
+      latencyWrap.hidden = !on;
+      punchWrap.hidden = !on;
+      latencyBtn.hidden = !on;
+      $('liveLowLatWrap').hidden = !on;
+      if (on) refreshRecordTargets();
+      else recordTarget.hidden = true;
+      if (on) {
+        meterTimer = requestAnimationFrame(meterTick);
+      } else {
+        cancelAnimationFrame(meterTimer);
+        meterBar.style.width = '0%';
+      }
+      sum.textContent = on ? 'on' : '';
+      sum.classList.toggle('on', on);
+    };
+
+    // ---- recording your own take while monitoring, as a new track alongside the others ----
+    let recordStart = 0;
+    let recordTimer = 0;
+    /** Polls the playhead during a punch-in take to stop it at the end of the loop. */
+    let punchWatch = 0;
+    /** The tempo to restore once recording stops, if it had to be forced to 100% to start it. */
+    let restoreTempo: number | null = null;
+    /** True while a loop that was on has been suspended for the take (its wrap would jump the playhead). */
+    let loopSuspended = false;
+    const jumpButtons = ['toStartBtn', 'toEndBtn', 'loopBtn'].map((id) => $<HTMLButtonElement>(id));
+    /** Puts a suspended loop back exactly as it was; the deck's own loop state was never touched. */
+    const resumeLoop = () => {
+      if (!loopSuspended) return;
+      loopSuspended = false;
+      this.player.setLoop(this.loop.on, this.loop.a, this.loop.b);
+    };
+    const recordUi = (on: boolean) => {
+      for (const b of jumpButtons) b.disabled = on;
+      pressed(recordBtn, on);
+      recordBtn.textContent = on ? '■ Stop' : '● Record';
+      recordTime.hidden = !on;
+      if (on) {
+        recordStart = performance.now();
+        recordTime.textContent = '0:00';
+        recordTimer = window.setInterval(() => (recordTime.textContent = fmtTime((performance.now() - recordStart) / 1000)), 500);
+      } else {
+        clearInterval(recordTimer);
+        clearInterval(punchWatch);
+      }
+    };
+    /** Stops an in-progress recording (if any) and turns it into a track. Used by the Record
+     * button and by "Stop" on Monitor itself, so switching off monitoring never silently drops
+     * a take that's in progress. */
+    const finishRecording = async () => {
+      if (!this.player.recording) return;
+      recordUi(false);
+      const take = await this.player.stopRecording();
+      await this.finishRecordLane(take);
+      resumeLoop();
+      if (restoreTempo != null) {
+        this.setTempoPitch(restoreTempo, this.pitch);
+        restoreTempo = null;
+      }
+    };
+    recordBtn.onclick = () => {
+      if (this.player.recording) {
+        void finishRecording();
+        return;
+      }
+      // Which track this take goes into is decided now, before the lead-in, not after.
+      const targetIdx = recordTarget.hidden || recordTarget.value === 'new' ? NaN : Number(recordTarget.value);
+      const target = Number.isFinite(targetIdx) ? this.lanes[targetIdx] : undefined;
+      const punch = punchBox.checked;
+      if (punch && !(this.loop.b > this.loop.a)) {
+        toast('Punch-in needs a loop section: Shift-drag across the waveform, or use Set A and Set B.', true);
+        return;
+      }
+      void (async () => {
+        recordBtn.disabled = true;
+        try {
+          // A recorded take is raw mic/instrument audio in real wall-clock time; it never goes
+          // through the song's own time-stretcher. Placing it against the song's native timeline
+          // only lines up if that timeline is advancing at 1x, so force 100% tempo for the
+          // recording — restored afterwards — rather than let a slowed-down take quietly drift
+          // out of sync with nothing to show for it until it's too late to redo.
+          if (this.tempo !== 1) {
+            restoreTempo = this.tempo;
+            this.setTempoPitch(1, this.pitch);
+            toast('Tempo reset to 100% for recording');
+          }
+          // Otherwise it's very easy to hit Record on a paused song (or a beat late on a
+          // playing one) and get a take that's nowhere near in sync. Start playback first if
+          // it isn't already, and give a short lead-in — a bar at the song's tempo if known,
+          // else a fixed beat — before capture actually starts, so there's time to come in on
+          // the beat instead of getting cut off mid-breath.
+          if (this.loop.on) {
+            loopSuspended = true;
+            this.player.setLoop(false, this.loop.a, this.loop.b);
+            toast('Loop paused while recording');
+          }
+          const bpm = this.r?.analysis?.bpm;
+          let punchEnd: number | null = null;
+          if (punch) {
+            // Punch in: play from a bar before the section and record from A to B. The playhead is
+            // the timing, so there's no separate lead-in.
+            const a = this.loop.a;
+            const from = Math.max(0, a - (bpm ? Math.round((60 / bpm) * this.pr.perBar * SR) : 3 * SR));
+            status.textContent = 'Pre-roll…';
+            this.player.seek(from);
+            await this.player.play();
+            const arrived = await this.waitForPlayhead(a, ((a - from) / SR) * 1000 + 3000);
+            if (!arrived || !this.player.monitoring) {
+              status.textContent = '';
+              return; // cancelled, or the playhead never got there
+            }
+            punchEnd = this.loop.b;
+          } else {
+            if (!this.player.state.playing) await this.player.play();
+            const leadInMs = bpm ? Math.max(800, Math.min(4000, (60 / bpm) * this.pr.perBar * 1000)) : 1500;
+            status.textContent = 'Get ready…';
+            await new Promise((res) => setTimeout(res, leadInMs));
+            if (!this.player.monitoring) return; // monitoring stopped during the lead-in
+          }
+          status.textContent = '';
+          this.recordPunchEnd = punchEnd;
+          this.player.startRecording();
+          this.beginRecordLane(target);
+          refreshRecordTargets();
+          recordUi(true);
+          if (punchEnd != null) {
+            const end = punchEnd;
+            punchWatch = window.setInterval(() => {
+              if (this.player.state.pos < end) return;
+              clearInterval(punchWatch);
+              void finishRecording().then(() => this.player.pause());
+            }, 15);
+          }
+        } catch (e) {
+          toast(`Couldn't start recording: ${(e as Error).message}`, true);
+        } finally {
+          recordBtn.disabled = false;
+          // Didn't end up recording after all (lead-in cancelled, or it failed to start): put
+          // the tempo back rather than leave it stuck at 100% with nothing to show for it.
+          if (!this.player.recording) {
+            resumeLoop();
+            this.recordPunchEnd = null;
+          }
+          if (!this.player.recording && restoreTempo != null) {
+            this.setTempoPitch(restoreTempo, this.pitch);
+            restoreTempo = null;
+          }
+        }
+      })();
+    };
+
+    this.stopLiveInputUi = () => {
+      if (!this.player.monitoring) return;
+      void finishRecording().then(() => {
+        this.player.stopMonitor();
+        showLatency();
+        setUi(false);
+        status.textContent = '';
+      });
+    };
+
+    btn.onclick = async () => {
+      if (this.player.monitoring) {
+        this.stopLiveInputUi();
+        return;
+      }
+      btn.disabled = true;
+      status.textContent = 'Starting…';
+      try {
+        const channels = await this.player.startMonitor(deviceSel.value || undefined, Number(vol.value), Number(pan.value), channelSel.value as LiveChannel);
+        await refreshDevices();
+        setUi(true);
+        showLatency();
+        // In native mode the input device and channel come from the Native audio row, so these two don't apply.
+        if (this.player.monitorIsNative) {
+          deviceSel.hidden = true;
+          channelSel.hidden = true;
+        }
+        status.textContent = this.player.monitorIsNative
+          ? 'Native input: device and channel come from the Native audio row. Takes line up using the latency measured below.'
+          : channels
+            ? `Input has ${channels} channel${channels === 1 ? '' : 's'}.`
+            : '';
+      } catch (e) {
+        status.textContent = "Couldn't start.";
+        toast(`Live input: ${(e as Error).message}`, true);
+      } finally {
+        btn.disabled = false;
+      }
+    };
+    deviceSel.onchange = () => {
+      if (!this.player.monitoring) return;
+      void this.player.startMonitor(deviceSel.value || undefined, Number(vol.value), Number(pan.value), channelSel.value as LiveChannel).then(() => setUi(true));
+    };
+    channelSel.onchange = () => {
+      saveLiveChannel(channelSel.value as LiveChannel);
+      this.player.setMonitorChannel(channelSel.value as LiveChannel);
+    };
+    vol.oninput = () => this.player.setMonitorGain(Number(vol.value));
+    const setPan = (v: number) => {
+      pan.value = String(v);
+      panOut.textContent = v === 0 ? 'CTR' : `${v < 0 ? 'L' : 'R'}${Math.round(Math.abs(v) * 100)}`;
+      this.player.setMonitorPan(v);
+    };
+    pan.oninput = () => setPan(Number(pan.value));
+    pan.ondblclick = () => setPan(0);
+
+    void refreshDevices();
+  }
+
+  // ---------- tuner: pitch detection against the live input or any track ----------
+  private refreshTunerSources() {
+    const sel = $<HTMLSelectElement>('tunerSource');
+    const current = sel.value;
+    const options: HTMLOptionElement[] = [];
+    const hasMonitor = !!navigator.mediaDevices?.getUserMedia;
+    if (hasMonitor) options.push(h('option', { value: 'monitor' }, 'Live input (Monitor)'));
+    options.push(...this.lanes.map((l, i) => h('option', { value: String(i) }, laneLabel(l))));
+    sel.replaceChildren(...options);
+    if ([...sel.options].some((o) => o.value === current)) sel.value = current;
+  }
+
+  private initTuner() {
+    const pane = document.querySelector<HTMLElement>('[data-pane="tuner"]')!;
+    const noteEl = $('tunerNote');
+    const needle = $('tunerNeedle');
+    const hz = $('tunerHz');
+    const status = $('tunerStatus');
+    const sel = $<HTMLSelectElement>('tunerSource');
+    const N = 4096;
+
+    const clear = () => {
+      noteEl.textContent = '–';
+      // A non-breaking space, not '': an empty line box is shorter than one with real text
+      // (as tall as the font's natural line height), so losing the note between one note and
+      // the next made this row's height flicker every tick while a track was playing.
+      hz.textContent = ' ';
+      needle.style.left = '50%';
+      needle.classList.remove('in-tune');
+    };
+
+    const tick = () => {
+      if (pane.hidden || !this.r) {
+        setTimeout(tick, 200);
+        return;
+      }
+      const src = sel.value;
+      let result: ReturnType<typeof detectPitch> = null;
+      let shift = 0;
+      if (src === 'monitor') {
+        const td = this.player.monitorTimeDomain();
+        if (td) result = detectPitch(td.buf, td.sampleRate);
+        status.textContent = td ? '' : 'Start Live input monitoring first';
+      } else {
+        const lane = this.lanes[Number(src)];
+        if (lane) {
+          const data = lane.data;
+          const len = data[0].length;
+          const start = Math.max(0, Math.min(Math.max(0, len - N), Math.round(this.player.state.pos)));
+          const end = Math.min(len, start + N);
+          const mono = new Float32Array(end - start);
+          for (let i = 0; i < mono.length; i++) mono[i] = (data[0][start + i] + data[1][start + i]) / 2;
+          result = detectPitch(mono, SR);
+          shift = this.pitch;
+        }
+        status.textContent = '';
+      }
+      if (result) {
+        const { note, cents } = freqToNote(result.freq);
+        noteEl.textContent = noteName(note + shift);
+        hz.textContent = `${result.freq.toFixed(1)} Hz`;
+        needle.style.left = `${50 + Math.max(-50, Math.min(50, cents))}%`;
+        needle.classList.toggle('in-tune', Math.abs(cents) <= 5);
+        if (!status.textContent) status.textContent = Math.abs(cents) <= 5 ? 'In tune' : cents < 0 ? 'Flat' : 'Sharp';
+      } else {
+        clear();
+        if (!status.textContent) status.textContent = 'Play a single note';
+      }
+      setTimeout(tick, 90);
+    };
+    tick();
+
+    this.refreshTunerSources();
+  }
+
+  /** Clears the playing trainer's running tally — a fresh count per pass, not accumulated across
+   * loops or songs. Called when the trainer's switched on, a song loads, and (from initTrainer) on a
+   * backward jump in the tab's own timeline (a loop restart or a scrub back). */
+  /** A loop pass of the tab has just finished (the timeline jumped back): if the speed trainer is gated
+   * on how well it was played, decide from this pass's tally whether to step up (see gateStep). Counts
+   * the note still being judged as finished, since the jump back is what ends it. */
+  private finishTrainerPass() {
+    const t = this.pr.trainer;
+    if (!t.on || !t.gate) return;
+    if (this.trainerGroupStart !== null) this.tallyGroup(this.trainerGroupHit);
+    this.commitBar(this.barTally.flush());
+    const res = gateStep(this.trainerClean, this.trainerHit, this.trainerTotal, t.gate, t.every);
+    this.trainerClean = res.clean;
+    const pct = this.trainerTotal ? Math.round((100 * this.trainerHit) / this.trainerTotal) : null;
+    if (pct === null) this.gateStatus = 'last pass: nothing heard';
+    else if (res.step) {
+      const next = Math.min(t.to, Math.round((this.tempo + t.step) * 100) / 100);
+      this.gateStatus = `last pass ${pct}% — good, speeding up`;
+      if (next !== this.tempo) this.setTempoPitch(next, this.pitch);
+    } else if (pct / 100 >= t.gate) this.gateStatus = `last pass ${pct}% — ${this.trainerClean} of ${t.every} clean`;
+    else this.gateStatus = `last pass ${pct}% — need ${Math.round(t.gate * 100)}%, holding speed`;
+    this.updateTrainerInfo(this.player.state.passes, this.player.state.countingIn);
+  }
+
+  private resetGate() {
+    this.trainerClean = 0;
+    this.gateStatus = '';
+  }
+
+  /** A judged note group has ended: it counts towards the pass's tally and towards its bar's colour. */
+  private tallyGroup(hit: boolean) {
+    this.trainerTotal++;
+    if (hit) this.trainerHit++;
+    if (this.trainerGroupBar >= 0) this.commitBar(this.barTally.group(this.trainerGroupBar, hit));
+  }
+
+  /** A bar has been played through (or playing moved on): its result replaces the last one and the colours update. */
+  private commitBar(v: BarVisit | null) {
+    if (!v || v.total <= 0) return;
+    (this.scratch.tabBarScores ??= {})[String(v.bar)] = [v.hit, v.total];
+    this.paintBarScores();
+    this.emit();
+  }
+
+  /** Colours each bar number on the engraved tab by how well that bar was last played (none until it has been). */
+  private paintBarScores() {
+    const scores = this.scratch.tabBarScores ?? {};
+    for (const rect of $('tabStripTrack').querySelectorAll<SVGRectElement>('rect.tab-barnum')) {
+      const bar = Number(rect.dataset.barnum);
+      const sc = scores[String(bar)];
+      if (sc && sc[1] > 0) {
+        rect.style.fill = barColour(sc[0], sc[1]);
+        rect.style.fillOpacity = '0.8';
+        // The colour is not the only cue: a clean bar has a plain chip, a part-right one a dashed outline, a mostly-missed one a heavy outline.
+        const cue = barCue(sc[0], sc[1]);
+        rect.style.stroke = cue === 'clean' ? '' : '#222';
+        rect.style.strokeWidth = cue === 'missed' ? '2.5' : cue === 'partial' ? '1.5' : '';
+        rect.style.strokeDasharray = cue === 'partial' ? '3 2' : '';
+      } else {
+        rect.style.fill = '';
+        rect.style.fillOpacity = '';
+        rect.style.stroke = '';
+        rect.style.strokeWidth = '';
+        rect.style.strokeDasharray = '';
+      }
+      const title = rect.querySelector('title');
+      if (title) title.textContent = barTip(bar, sc);
+    }
+    $('tabBarScoresClear').hidden = !(Object.keys(scores).length && !$('tabStrip').hidden);
+  }
+
+  private resetTrainerTally() {
+    this.commitBar(this.barTally.flush());
+    this.trainerTotal = 0;
+    this.trainerHit = 0;
+    this.trainerGroupStart = null;
+    this.trainerGroupHit = false;
+    this.trainerLastU = 0;
+  }
+
+  /** Compares live mic pitch against whichever of the tab's notes is expected right now, colouring
+   * the engraved view's note box(es) and keeping a running hit/total tally. Same self-scheduling
+   * shape as initTuner just above, but reads stripNotes (the raw parse, not its drawn geometry) and
+   * the same tap-anchor timeline the engraved view itself scrolls by (charOffsetAt via timeline()),
+   * so "the note currently highlighted" and "the note being judged" are always the same one. */
+  private initTrainer() {
+    const status = $('tabTrainerStatus');
+    const boxes = () => [$('tabStripNoteBox'), $('tabStaffNoteBox')];
+
+    const paint = (cls: 'trainer-hit' | 'trainer-miss' | null) => {
+      for (const b of boxes()) {
+        b.classList.toggle('trainer-hit', cls === 'trainer-hit');
+        b.classList.toggle('trainer-miss', cls === 'trainer-miss');
+      }
+    };
+
+    const tick = () => {
+      const on = !!this.scratch.tabTrainer;
+      if (!on || $('tabStrip').hidden || !this.r) {
+        paint(null);
+        setTimeout(tick, 200);
+        return;
+      }
+      if (!this.player.monitoring) {
+        status.textContent = 'Start Live input monitoring to use this';
+        paint(null);
+        setTimeout(tick, 200);
+        return;
+      }
+      if (!this.player.state.playing) {
+        this.commitBar(this.barTally.flush());
+        status.textContent = this.trainerTotal ? `${this.trainerHit}/${this.trainerTotal} · ${Math.round((100 * this.trainerHit) / this.trainerTotal)}%` : 'Press play to begin';
+        paint(null);
+        setTimeout(tick, 200);
+        return;
+      }
+      // Monitored audio lags the track by the mic round-trip (see the Live input latency
+      // measurement) — without this, the note looked up is whichever one the track was actually
+      // playing *before* what's being heard right now, not the one it's testing against.
+      const latencySamples = (loadRecLatencyMs() / 1000) * SR;
+      const tSec = (this.smoothStripPos() - latencySamples) / SR;
+      const u = this.coordAt(tSec);
+      // Judged against the counting-on position, so a repeat jumping back to its start isn't mistaken
+      // for a scrub back (which restarts the tally) — only a real backward jump is.
+      const uu = this.unrolledAt(tSec);
+      if (uu !== null && uu < this.trainerLastU - 0.5) {
+        this.finishTrainerPass();
+        this.resetTrainerTally();
+      }
+      if (uu !== null) this.trainerLastU = uu;
+      const group = u === null ? [] : noteGroupAt(this.stripNotes ?? [], u);
+
+      if (group.length && group[0].start !== this.trainerGroupStart) {
+        if (this.trainerGroupStart !== null) this.tallyGroup(this.trainerGroupHit);
+        this.trainerGroupStart = group[0].start;
+        this.trainerGroupBar = group[0].bar;
+        this.trainerGroupHit = false;
+      } else if (!group.length && this.trainerGroupStart !== null) {
+        this.tallyGroup(this.trainerGroupHit);
+        this.trainerGroupStart = null;
+      }
+
+      let cls: 'trainer-hit' | 'trainer-miss' | null = null;
+      if (group.length) {
+        const td = this.player.monitorTimeDomain();
+        const result = td && detectPitch(td.buf, td.sampleRate);
+        if (result) {
+          const hit = group.some((n) => acceptedMidis(n).some((m) => Math.abs(centsFrom(result.freq, m)) <= TRAINER_TOLERANCE_CENTS));
+          cls = hit ? 'trainer-hit' : 'trainer-miss';
+          if (hit) this.trainerGroupHit = true;
+        }
+      }
+      paint(cls);
+      status.textContent = this.trainerTotal ? `${this.trainerHit}/${this.trainerTotal} · ${Math.round((100 * this.trainerHit) / this.trainerTotal)}%` : 'Listening…';
+      setTimeout(tick, 90);
+    };
+    tick();
+  }
+
+  // ---------- scratchpad: plain-text lyrics, tab, drum tab and notes, per song ----------
+  private initScratchpad() {
+    const tabBtns = {
+      lyrics: $<HTMLButtonElement>('scratchTabLyrics'),
+      notes: $<HTMLButtonElement>('scratchTabNotes'),
+    };
+    const partBtns: Record<PartId, HTMLButtonElement> = {
+      guitar: $<HTMLButtonElement>('scratchTabGuitar'),
+      bass: $<HTMLButtonElement>('scratchTabBass'),
+      drums: $<HTMLButtonElement>('scratchTabDrums'),
+    };
+    this.partBtns = partBtns;
+    this.addPartBtn = $<HTMLButtonElement>('scratchAddPart');
+    const areas = {
+      lyrics: $<HTMLTextAreaElement>('scratchLyrics'),
+      tab: $<HTMLTextAreaElement>('scratchTab'),
+      drums: $<HTMLTextAreaElement>('scratchDrums'),
+      notes: $<HTMLTextAreaElement>('scratchNotes'),
+    };
+    this.scratchAreas = areas;
+    const show = (name: keyof typeof areas) => {
+      for (const k of Object.keys(areas) as (keyof typeof areas)[]) areas[k].hidden = k !== name;
+      pressed(tabBtns.lyrics, name === 'lyrics');
+      pressed(tabBtns.notes, name === 'notes');
+      // Clicking the tab button leaves focus on the button itself, not the text box it reveals,
+      // so typing right after switching tabs (the natural next move) hit the deck's own keyboard
+      // shortcuts instead of the text — a "0"/"-" for tab notation would zoom out, "1"-"6" would
+      // mute a track, etc. Move focus into the box so typing lands there immediately. A no-op if
+      // the pane isn't actually visible yet (e.g. this initial call, before a song is open).
+      this.scratchTab = name;
+      this.updateLyricsView();
+      this.updateTabView();
+      this.updatePartUi();
+      if (!areas[name].hidden) areas[name].focus();
+    };
+    this.showPart = (id) => {
+      this.switchTabPart(id); // every part, the drums too, is edited in the one tab editor (and followed along in the one strip)
+      show('tab');
+    };
+    tabBtns.lyrics.onclick = () => show('lyrics');
+    tabBtns.notes.onclick = () => show('notes');
+    for (const id of PART_IDS) this.wirePartButton(id, partBtns[id]);
+    this.addPartBtn.onclick = () => this.addPart();
+    $('partDeleteBtn').onclick = () => {
+      const id = this.currentPart();
+      if (id && !isBuiltinPart(id)) this.deletePart(id);
+    };
+    this.partTrackDd = createDropdown();
+    $('partTrackMount').replaceWith(this.partTrackDd.el);
+    this.partTrackDd.onChange = (v) => {
+      const id = this.currentPart();
+      if (!id) return;
+      this.scratch.partTracks = { ...this.scratch.partTracks, [id]: v };
+      this.updatePartUi();
+      this.emit();
+    };
+    $('partMuteBtn').onclick = () => {
+      const id = this.currentPart();
+      const lane = id && this.partLane(id);
+      if (lane) this.setLaneRecorded(lane, { mute: !lane.mute });
+    };
+    show('lyrics');
+
+    // "Extend line": add more bars to every string/beat line at once, staying lined up, instead
+    // of hand-typing dashes onto each one separately. Works on whichever of Tab/Drum tab is open.
+    const extend = (ta: HTMLTextAreaElement) => {
+      const pos = ta.selectionStart;
+      ta.value = extendTabText(ta.value, this.isDrums() ? areas.drums.placeholder : ta.placeholder);
+      ta.setSelectionRange(pos, pos);
+      ta.dispatchEvent(new Event('input'));
+      ta.focus();
+    };
+    $('tabExtendBtn').onclick = () => extend(areas.tab);
+    for (const ta of [areas.tab, areas.drums])
+      ta.addEventListener('keydown', (e) => {
+        if (e.key === 'Tab' && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) {
+          e.preventDefault();
+          extend(ta);
+        }
+      });
+
+    areas.lyrics.oninput = () => {
+      this.scratch.lyrics = areas.lyrics.value;
+      this.setLyricsText(areas.lyrics.value);
+      this.updateScratchSummary();
+      this.emit();
+    };
+    // Synced lyrics: load an .lrc file, follow along, and nudge the timing.
+    ($('lyricsImport') as HTMLInputElement).onchange = async (e) => {
+      const input = e.target as HTMLInputElement;
+      const file = input.files?.[0];
+      input.value = '';
+      if (!file) return;
+      if (areas.lyrics.value.trim() && !confirm('Replace the lyrics for this song with the contents of this file?')) return;
+      const text = await file.text();
+      areas.lyrics.value = text;
+      this.scratch.lyrics = text;
+      this.setLyricsText(text);
+      if (this.lrc) this.scratch.lyricsFollow = true;
+      else toast("That file has no [mm:ss.xx] timestamps, so it's loaded as plain lyrics and can't follow along.", true);
+      this.updateLyricsView();
+      this.updateScratchSummary();
+      this.emit();
+    };
+    $('lyricsFollowBtn').onclick = () => {
+      this.scratch.lyricsFollow = !this.scratch.lyricsFollow;
+      this.updateLyricsView();
+      this.emit();
+    };
+    $('lyricsChordsBtn').onclick = () => {
+      this.scratch.lyricsChords = !this.scratch.lyricsChords;
+      if (this.scratch.lyricsChords) this.tx.ensureChords();
+      this.lyricChordKey = '';
+      this.lyricIdx = -2;
+      this.updateLyricsView();
+      this.dirty = true;
+      this.emit();
+    };
+    const nudge = (d: number) => {
+      this.scratch.lyricsOffset = Math.round(((this.scratch.lyricsOffset ?? 0) + d) * 10) / 10;
+      this.lyricIdx = -2; // re-highlight for the new timing
+      this.lyricChordKey = ''; // and put the chords where the new timing says
+      this.updateLyricsView();
+      this.dirty = true;
+      this.emit();
+    };
+    $('lyricsSooner').onclick = () => nudge(-0.2);
+    $('lyricsLater').onclick = () => nudge(0.2);
+    areas.tab.oninput = () => {
+      this.scratch.tab = areas.tab.value;
+      this.selectedRhythmNote = null; // a direct text edit can move/remove what was selected
+      if (!$('tabStrip').hidden) {
+        clearTimeout(this.stripTimer);
+        this.stripTimer = window.setTimeout(() => void this.renderTabStrip(), 250);
+      }
+      if (!$('tabStaff').hidden) {
+        clearTimeout(this.staffTimer);
+        this.staffTimer = window.setTimeout(() => void this.renderStaff(), 250);
+      }
+      this.updateScratchSummary();
+      this.emit();
+    };
+    // Tab+ : tap along with the music to mark where the text cursor is right now, then follow
+    // along scrolls/highlights by interpolating between those taps (see src/lyrics/tabSync.ts).
+    $('tabTapBtn').onmousedown = (e) => e.preventDefault(); // keep focus (and the cursor position) on the textarea
+    const tap = () => {
+      const charOffset = areas.tab.selectionStart;
+      const time = this.player.state.pos / SR;
+      if (isLockedAt(this.scratch.tabAnchors ?? [], charOffset)) {
+        toast('That tap is locked. Unlock it (select its tag) to re-tap.');
+        return;
+      }
+      this.scratch.tabAnchors = addAnchor(this.scratch.tabAnchors ?? [], { charOffset, time });
+      this.updateTabView();
+      this.emit();
+    };
+    $('tabTapBtn').onclick = tap;
+    // Ctrl/Cmd+Enter taps from the keyboard while the cursor is in the tab text (a plain key would
+    // type into it, and the deck's own shortcuts don't run inside a text box).
+    areas.tab.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey) {
+        e.preventDefault();
+        tap();
+      }
+    });
+    $('tabFollowBtn').onclick = () => {
+      this.scratch.tabFollow = !this.scratch.tabFollow;
+      this.updateTabView();
+      this.emit();
+    };
+    $('tabSymbolsBtn').onclick = () => {
+      this.tabSymbolsOpen = !this.tabSymbolsOpen;
+      this.updateTabView();
+    };
+    $('tabStaffBtn').onclick = () => {
+      this.scratch.tabStaff = !this.scratch.tabStaff;
+      this.updateTabView();
+      this.emit();
+    };
+    $('tabBarScoresClear').onclick = () => {
+      delete this.scratch.tabBarScores;
+      this.barTally.flush();
+      this.paintBarScores();
+      this.emit();
+    };
+    $('tabTrainerBtn').onclick = () => {
+      this.scratch.tabTrainer = !this.scratch.tabTrainer;
+      // Needs the engraved view visible to highlight right/wrong on; turning it on also turns that
+      // on if it wasn't already. One-directional — turning Follow back off later doesn't clear this
+      // flag, it just goes inert (no note box to colour) until Follow's on again.
+      if (this.scratch.tabTrainer) {
+        if (!this.scratch.tabFollow) this.scratch.tabFollow = true;
+        this.resetTrainerTally();
+      }
+      this.updateTabView();
+      this.emit();
+    };
+    $('tabEarBtn').onclick = () => {
+      this.scratch.tabEar = !this.scratch.tabEar;
+      if (this.scratch.tabEar && !this.scratch.tabFollow) this.scratch.tabFollow = true; // it hides the engraved view, so needs it
+      this.updateTabView();
+      this.emit();
+    };
+    $('tabClearAnchorsBtn').onclick = () => {
+      if (!confirm("Clear this tab's timing? You'll need to tap it back in.")) return;
+      this.scratch.tabAnchors = [];
+      this.selectedTap = null;
+      this.selectedRhythmNote = null;
+      this.scratch.tabFollow = false;
+      this.scratch.tabTrainer = false;
+      this.scratch.tabEar = false;
+      this.updateTabView();
+      this.emit();
+    };
+    // Tab+ rhythm editing: click a note in Follow along (its fret number or its stem — both are
+    // tagged the same way, see drawTabScore in staff.ts) to select it, then press w/h/q/e/s to set
+    // its length, written straight into the rhythm line (inserting one for the block first if it
+    // doesn't have one yet). Delegated on the track itself rather than per-note listeners, since the
+    // view is redrawn from scratch on every change.
+    this.initTabPan('tabStripView', () => this.stripLayout);
+    this.initTabPan('tabStaffView', () => this.staffLayout);
+    $('tabStripTrack').addEventListener('click', (e) => {
+      if (this.tabPanMoved) {
+        this.tabPanMoved = false; // the click that ends a drag, not a selection
+        return;
+      }
+      // A bar number: loop that bar (Shift: from the last one clicked to this one) — see loopBars.
+      const barNum = (e.target as Element).closest<SVGElement>('[data-barnum]');
+      if (barNum) {
+        const bar = Number(barNum.dataset.barnum);
+        const from = e.shiftKey && this.lastLoopBar !== null ? this.lastLoopBar : bar;
+        this.lastLoopBar = bar;
+        this.loopBars(Math.min(from, bar), Math.max(from, bar));
+        return;
+      }
+      const el = (e.target as HTMLElement).closest<HTMLElement>('[data-col]');
+      this.selectedRhythmNote = el ? { bar: Number(el.dataset.bar), col: Number(el.dataset.col) } : null;
+      this.updateTabStrip();
+    });
+    // "Add rhythm line": a line under each block of strings for note lengths (see tabSync.ts). Taps are
+    // positions in the text, so each insertion shifts the taps after it by the length of what went in.
+    $('tabRhythmBtn').onclick = () => {
+      const text = areas.tab.value;
+      const lines = text.split('\n');
+      const blocks = tabBlocks(text);
+      const starts: number[] = [];
+      let at = 0;
+      for (const l of lines) {
+        starts.push(at);
+        at += l.length + 1;
+      }
+      let anchors = this.scratch.tabAnchors ?? [];
+      let added = 0;
+      for (const b of [...blocks].reverse()) {
+        if (b.rhythmRow !== undefined) continue;
+        let col = b.label;
+        for (let c = b.label; c < b.chars; c++) {
+          if (lines.slice(b.stringFirst, b.stringLast + 1).some((r) => /[0-9xX]/.test(r[c] ?? ''))) {
+            col = c;
+            break;
+          }
+        }
+        const line = ' '.repeat(col) + 'e';
+        lines.splice(b.lastRow + 1, 0, line);
+        const insertAt = b.lastRow + 1 < starts.length ? starts[b.lastRow + 1] : text.length + 1;
+        const grew = line.length + 1;
+        anchors = anchors.map((a) => (a.charOffset >= insertAt ? { ...a, charOffset: a.charOffset + grew } : a));
+        added++;
+      }
+      if (!added) {
+        toast('Every block already has a rhythm line.');
+        return;
+      }
+      const pos = areas.tab.selectionStart;
+      areas.tab.value = lines.join('\n');
+      areas.tab.setSelectionRange(pos, pos);
+      this.scratch.tabAnchors = anchors;
+      areas.tab.dispatchEvent(new Event('input'));
+      this.updateTabView();
+      toast('Rhythm line added. Put q, e, s… under each note; a note with no letter repeats the last one.');
+    };
+    $('tabTapLockBtn').onclick = () => {
+      if (this.selectedTap === null) return;
+      this.scratch.tabAnchors = toggleAnchorLock(this.scratch.tabAnchors ?? [], this.selectedTap);
+      this.updateTabView();
+      this.emit();
+    };
+    $('tabTapRemoveBtn').onclick = () => this.removeSelectedTap();
+    areas.notes.oninput = () => {
+      this.scratch.notes = areas.notes.value;
+      this.updateScratchSummary();
+      this.emit();
+    };
+  }
+
+  private applyScratch(saved?: ScratchState) {
+    // Whatever version saved this song, bring it up to the current layout first (see normaliseScratch: old single tabs, the old
+    // drum box, a deleted part).
+    const s = saved ? normaliseScratch(saved) : saved;
+    this.scratch = { lyrics: s?.lyrics ?? '', tab: s?.tab ?? '', notes: s?.notes ?? '' };
+    if (s?.lyricsFollow) this.scratch.lyricsFollow = true;
+    if (s?.lyricsOffset) this.scratch.lyricsOffset = s.lyricsOffset;
+    if (s?.lyricsChords) this.scratch.lyricsChords = true;
+    if (s?.tabAnchors?.length) this.scratch.tabAnchors = s.tabAnchors;
+    if (s?.tabFollow) this.scratch.tabFollow = true;
+    if (s?.tabStaff) this.scratch.tabStaff = true;
+    if (s?.tabTrainer) this.scratch.tabTrainer = true;
+    if (s?.tabEar) this.scratch.tabEar = true;
+    this.resetTrainerTally(); // (before the scores below are restored: it commits whatever bar the last song left half played)
+    if (s?.tabBarScores && Object.keys(s.tabBarScores).length) this.scratch.tabBarScores = s.tabBarScores;
+    if (s?.tabPart) this.scratch.tabPart = s.tabPart;
+    if (s?.tabParts && Object.keys(s.tabParts).length) this.scratch.tabParts = structuredClone(s.tabParts);
+    if (s?.extraParts?.length) this.scratch.extraParts = s.extraParts.map((p) => ({ ...p }));
+    if (s?.partNames && Object.keys(s.partNames).length) this.scratch.partNames = { ...s.partNames };
+    if (s?.partTracks && Object.keys(s.partTracks).length) this.scratch.partTracks = { ...s.partTracks };
+    this.scratchAreas.lyrics.value = this.scratch.lyrics ?? '';
+    this.setLyricsText(this.scratch.lyrics ?? '');
+    // Tab/Drum tab start with the blank string/beat template actually typed in (not just a
+    // placeholder hint), so there's something to type fret numbers or hits onto directly. Only
+    // for a song that has nothing saved yet; this.scratch itself stays empty until they edit it,
+    // so an untouched template is never mistaken for real content or saved as one.
+    this.showTabText();
+    this.scratchAreas.notes.value = this.scratch.notes ?? '';
+    this.updateTabView();
+    this.updateScratchSummary();
+    this.updatePartUi();
+  }
+
+  /** Re-reads the lyrics text: synced (LRC) lyrics get a follow-along view, plain ones don't. */
+  private setLyricsText(text: string) {
+    this.lrc = parseLrc(text);
+    const box = $('lyricsFollow');
+    box.replaceChildren();
+    this.lyricEls = [];
+    this.lyricIdx = -2;
+    this.lyricChordEls = [];
+    this.lyricChordNow = -1;
+    const withChords = !!this.scratch.lyricsChords && !!this.lrc;
+    this.lyricChordKey = withChords ? this.tx.chordKey() : '';
+    box.classList.toggle('with-chords', withChords);
+    const lines = this.lrc?.lines ?? [];
+    const off = this.scratch.lyricsOffset ?? 0;
+    for (const [i, line] of lines.entries()) {
+      const el = h('div', { class: 'lyric-line' });
+      if (withChords) {
+        const next = lines.find((l) => l.t > line.t)?.t;
+        const t0 = line.t + off;
+        const nextT = next == null ? t0 + Math.max(4, line.text.length * 0.2) : next + off; // the last line ends when its words would
+        const marks = this.tx.chordMarks(t0, nextT);
+        for (const seg of segmentsFor(line.text, t0, nextT, marks)) {
+          const ch = h('span', { class: 'lc-ch' }, seg.chord ?? '');
+          if (seg.chord && seg.t != null) this.lyricChordEls.push({ t: seg.t, el: ch });
+          el.append(h('span', { class: 'lc-seg' }, ch, h('span', { class: 'lc-tx' }, seg.text || '\u00a0')));
+        }
+        if (!line.text && !el.childElementCount) el.append(h('span', { class: 'lc-tx' }, '\u00a0'));
+      } else el.textContent = line.text || '\u00a0';
+      el.onclick = () => this.player.seek((line.t + off) * SR);
+      el.title = `Jump to ${fmtTime(line.t + off)}`;
+      el.dataset.i = String(i);
+      this.lyricEls.push(el);
+      box.append(el);
+    }
+    this.updateLyricsView();
+    this.dirty = true;
+  }
+
+  /** Shows the raw text box or the follow-along view, and the controls that go with it, for the open tab. */
+  private updateLyricsView() {
+    const onLyrics = this.scratchTab === 'lyrics';
+    const synced = !!this.lrc;
+    const follow = synced && !!this.scratch.lyricsFollow;
+    $('lyricsImportLabel').hidden = !onLyrics;
+    $('lyricsFollowBtn').hidden = !(onLyrics && synced);
+    pressed($('lyricsFollowBtn'), follow);
+    $('lyricsChordsBtn').hidden = !(onLyrics && follow);
+    pressed($('lyricsChordsBtn'), !!this.scratch.lyricsChords);
+    $('lyricsNudge').hidden = !(onLyrics && follow);
+    const off = this.scratch.lyricsOffset ?? 0;
+    $('lyricsOffsetVal').textContent = off === 0 ? 'timing 0 s' : `timing ${off > 0 ? '+' : ''}${off.toFixed(1)} s`;
+    $('lyricsFollow').hidden = !(onLyrics && follow);
+    this.scratchAreas.lyrics.hidden = !onLyrics || follow;
+  }
+
+  /** Highlights the line being sung and keeps it in view; called every frame, but only touches the page when the line changes. */
+  private updateLyricsFollow(pos: number) {
+    if (!this.lrc || $('lyricsFollow').hidden) return;
+    if (this.scratch.lyricsChords) {
+      // Redraw when the chords or their names change (detected, corrected, pitch, Simple, capo), and light the one sounding now.
+      const key = this.tx.chordKey();
+      if (key !== this.lyricChordKey) {
+        this.setLyricsText(this.scratch.lyrics ?? '');
+        this.lyricIdx = -2;
+      }
+      const t = pos / SR;
+      let now = -1;
+      for (let i = 0; i < this.lyricChordEls.length && this.lyricChordEls[i].t <= t; i++) now = i;
+      if (now !== this.lyricChordNow) {
+        this.lyricChordEls[this.lyricChordNow]?.el.classList.remove('now');
+        this.lyricChordEls[now]?.el.classList.add('now');
+        this.lyricChordNow = now;
+      }
+    }
+    const idx = lineAt(this.lrc.lines, pos / SR - (this.scratch.lyricsOffset ?? 0));
+    if (idx === this.lyricIdx) return;
+    this.lyricIdx = idx;
+    this.lyricEls.forEach((el, i) => {
+      el.classList.toggle('current', i === idx);
+      el.classList.toggle('past', i < idx);
+    });
+    const box = $('lyricsFollow');
+    const el = this.lyricEls[idx];
+    // Scroll the lyrics box itself, not the page, so the rest of the deck doesn't jump around.
+    if (el) box.scrollTo({ top: el.offsetTop - box.clientHeight / 2 + el.clientHeight / 2, behavior: 'smooth' });
+  }
+
+  /** Shows the raw text box or the engraved follow-along view, and the controls that go with it, for
+   * the Tab pane. */
+  private updateTabView() {
+    const onTab = this.scratchTab === 'tab';
+    const anchors = this.scratch.tabAnchors ?? [];
+    // One tap is enough once the song has its own detected tempo to drive timing from (coordAt);
+    // without one, still needs a second tap for charOffsetAt's own interpolation to mean anything.
+    const canFollow = anchors.length >= 1 && (anchors.length >= MIN_ANCHORS || !!this.r?.analysis?.bpm);
+    const follow = canFollow && !!this.scratch.tabFollow;
+    $('tabTapBtn').hidden = !onTab;
+    $('tabRhythmBtn').hidden = !onTab;
+    const count = $('tabAnchorCount');
+    count.hidden = !onTab || anchors.length === 0;
+    if (!count.hidden) count.textContent = `${anchors.length} tap${anchors.length === 1 ? '' : 's'} set`;
+    $('tabFollowBtn').hidden = !(onTab && canFollow);
+    pressed($('tabFollowBtn'), follow);
+    $('tabClearAnchorsBtn').hidden = !(onTab && anchors.length > 0);
+    const sel = anchors.find((a) => a.charOffset === this.selectedTap);
+    if (!sel) this.selectedTap = null;
+    $('tabTapSel').hidden = !(onTab && sel);
+    if (sel) {
+      $('tabTapSelLabel').textContent = `T${anchors.indexOf(sel) + 1} · ${fmtTime(sel.time)}${sel.locked ? ' · locked' : ''}`;
+      $('tabTapLockBtn').textContent = sel.locked ? 'Unlock' : 'Lock';
+    }
+    const strip = onTab && follow;
+    $('tabStrip').hidden = !strip;
+    if (strip) void this.renderTabStrip();
+    // The drums have no rhythm line, no second staff and nothing for the playing trainer to judge (a mic hears a kit, not notes),
+    // and their own legend instead of the guitar's symbols.
+    const drums = onTab && this.isDrums();
+    $('tabRhythmBtn').hidden = !onTab || drums;
+    const staff = onTab && !drums && !!this.scratch.tabStaff;
+    $('tabSymbolsBtn').hidden = !onTab;
+    $('tabSymbols').hidden = !onTab || drums || !this.tabSymbolsOpen;
+    $('tabDrumSymbols').hidden = !drums || !this.tabSymbolsOpen;
+    pressed($('tabSymbolsBtn'), this.tabSymbolsOpen);
+    $('tabStaffBtn').hidden = !onTab || drums;
+    pressed($('tabStaffBtn'), !!this.scratch.tabStaff);
+    $('tabStaff').hidden = !staff;
+    if (staff) void this.renderStaff();
+    const trainer = canFollow && !drums && !!this.scratch.tabTrainer;
+    $('tabTrainerBtn').hidden = !(onTab && canFollow) || drums;
+    pressed($('tabTrainerBtn'), trainer);
+    $('tabTrainerStatus').hidden = !(onTab && trainer);
+    this.paintBarScores();
+    $('tabEarBtn').hidden = !(onTab && canFollow);
+    pressed($('tabEarBtn'), canFollow && !!this.scratch.tabEar);
+    this.updateEarHide();
+    this.lastStaffPx = NaN;
+    this.lastStripPx = NaN;
+    this.syncTimelineCursor(false, null); // corrected once the next frame knows where playback actually is
+    this.scratchAreas.tab.hidden = !onTab || follow;
+    this.dirty = true;
+  }
+
+  /** Ear training: hides the engraved tab (and the staff under it) while the song is playing, shows it
+   * again when it stops. The cursor and the Trainer's right/wrong box stay, so you still get marked. */
+  private updateEarHide() {
+    const hide = !!this.scratch.tabEar && !!this.scratch.tabFollow && this.player.state.playing;
+    $('tabTimeline').classList.toggle('ear-hidden', hide);
+  }
+
+  /** The tab's block layout and tap coordinates, cached until the text or the taps change. */
+  private timeline() {
+    // The text box's own value, not scratch.tab: an untouched song shows the placeholder template there.
+    const text = this.scratchAreas.tab.value;
+    const anchors = this.scratch.tabAnchors ?? [];
+    const t = this.tabTimeline;
+    if (t && t.text === text && t.anchors === anchors) return t;
+    const blocks = tabBlocks(text);
+    const coords = anchorCoords(text, blocks, anchors);
+    // Repeats: taps are on the written tab (the first time through); playback keeps counting up through
+    // a repeat, so the taps are converted to that counting-up ("unrolled") position to work from.
+    const plan = repeatPlan(this.parseActive(text).bars);
+    const coordsU = plan ? coords.map((a) => ({ ...a, charOffset: toUnrolled(plan, a.charOffset) })) : coords;
+    this.tabTimeline = { text, anchors, blocks, coords, plan, coordsU };
+    return this.tabTimeline;
+  }
+
+  /** The tab's current position (same u-space as TabNote.start), preferring the song's own tempo
+   * over interpolation whenever there's only one tap to anchor it — exact, since there's nothing to
+   * interpolate between, rather than approximate between two taps whose spacing might not exactly
+   * match the beat. Two or more taps still interpolate between them exactly as before (charOffsetAt),
+   * for a song whose tempo isn't reliable enough, or wasn't detected, to trust alone. */
+  private coordAt(t: number): number | null {
+    const uu = this.unrolledAt(t);
+    const plan = this.timeline().plan;
+    return uu === null || !plan ? uu : fromUnrolled(plan, uu);
+  }
+
+  /** How far along the *played* music is — counting straight on through a repeat — rather than where
+   * that is on the written tab (coordAt, which jumps back at each repeat). The trainer needs this one
+   * to tell a repeat's jump back from a real scrub back. Same as coordAt when there are no repeats. */
+  private unrolledAt(t: number): number | null {
+    const tl = this.timeline();
+    const bpm = this.r?.analysis?.bpm;
+    if (tl.coordsU.length === 1 && bpm) return coordAtBpm(tl.coordsU[0], bpm, t);
+    return charOffsetAt(tl.coordsU, t);
+  }
+
+  /** Redraws the engraved tab (fret numbers + rhythm row) from the tab as it is now, only if it's
+   * actually changed since the last drawing. Same shape as renderStaff just below, for the same
+   * reason: drawn into a spare element first, so a stale or failed drawing is never visible even for
+   * a moment, and a token guards against two overlapping redraws (typing fast) finishing out of order. */
+  private async renderTabStrip() {
+    const text = this.scratchAreas.tab.value;
+    if (text === this.stripText && this.stripLayout) return;
+    const token = ++this.stripToken;
+    const drums = this.isDrums();
+    const { notes, bars } = this.parseActive(text);
+    const track = $('tabStripTrack');
+    if (!notes.length) {
+      if (token !== this.stripToken) return;
+      track.replaceChildren(h('div', { class: 'tab-staff-note' }, drums ? 'No hits to show yet: write x or o in the drum grid (one row per kit piece, one column per sixteenth).' : 'No notes to show yet: type some fret numbers on the strings above.'));
+      this.stripLayout = null;
+      this.stripText = null;
+      this.stripNotes = null;
+      return;
+    }
+    const spare = document.createElement('div');
+    const layout = await (drums ? drawDrumScore(spare, notes as DrumNote[], bars) : drawTabScore(spare, notes, bars)).catch(() => null);
+    if (token !== this.stripToken) return;
+    if (!layout) {
+      track.replaceChildren(h('div', { class: 'tab-staff-note' }, drums ? "Couldn't draw the drums." : "Couldn't draw the tab."));
+      this.stripLayout = null;
+      this.stripText = null;
+      this.stripNotes = null;
+      return;
+    }
+    track.replaceChildren(...spare.childNodes);
+    this.stripLayout = layout;
+    this.stripText = text;
+    this.stripNotes = notes;
+    this.stripBars = bars;
+    this.paintBarScores();
+    $('tabStripView').style.height = `${layout.height}px`;
+    this.lastStripPx = NaN;
+    this.dirty = true;
+  }
+
+  /** Redraws the full staff from the tab as it is now (only if it has changed since the last drawing). */
+  private async renderStaff() {
+    const text = this.scratchAreas.tab.value;
+    if (text === this.staffText && this.staffLayout) return;
+    const token = ++this.staffToken;
+    const { notes, bars } = parseScore(text);
+    const track = $('tabStaffTrack');
+    if (!notes.length) {
+      if (token !== this.staffToken) return;
+      track.replaceChildren(h('div', { class: 'tab-staff-note' }, 'No notes to show yet: type some fret numbers on the strings above.'));
+      this.staffLayout = null;
+      this.staffText = null;
+      return;
+    }
+    // Drawn into a spare element first, so a stale or failed drawing never leaves the visible one half-finished.
+    const spare = document.createElement('div');
+    const layout = await drawStaff(spare, notes, bars).catch(() => null);
+    if (token !== this.staffToken) return;
+    if (!layout) {
+      track.replaceChildren(h('div', { class: 'tab-staff-note' }, "Couldn't draw the staff for this tab."));
+      this.staffLayout = null;
+      this.staffText = null;
+      return;
+    }
+    track.replaceChildren(...spare.childNodes);
+    this.staffLayout = layout;
+    this.staffText = text;
+    $('tabStaffView').style.height = `${layout.height}px`;
+    this.lastStaffPx = NaN;
+    this.dirty = true;
+  }
+
+  /** Slides the staff past its fixed cursor in step with the music (or leaves it at the start without timing). */
+  private updateTabStaff() {
+    const layout = this.staffLayout;
+    if (!layout || $('tabStaff').hidden) return;
+    const coord = this.coordAt(this.smoothStripPos() / SR);
+    const staffView = $('tabStaffView');
+    // Where the engraved tab's own cursor actually sits on the page — not 40% of the staff's own
+    // width, which was wrong: an independent 40%-of-own-width guess put the two boxes' marks at
+    // different x whenever their content didn't happen to be the same width. Falls back to that
+    // guess only when there's no engraved tab to line up with.
+    const stripCursor = $('tabStrip').hidden ? null : $('tabStripCursor').getBoundingClientRect();
+    const holdAt = stripCursor ? stripCursor.left + stripCursor.width / 2 - staffView.getBoundingClientRect().left : staffView.clientWidth * 0.4;
+    const x = coord === null ? 0 : staffX(layout.map, this.viewCoord(coord));
+    const px = coord === null ? 0 : holdAt - x;
+    $('tabStaffCursor').style.left = `${holdAt}px`;
+    $('tabStaffCursor').hidden = coord === null;
+    this.syncTimelineCursor(coord !== null, stripCursor);
+    // The notehead actually sounding right now, not just a position along the line — moves with the
+    // same px the track does, so it's simplest to add px directly rather than share the track's transform.
+    const note = coord === null ? null : noteAt(layout.notes, coord);
+    const box = $('tabStaffNoteBox');
+    box.hidden = !note;
+    if (note) {
+      box.style.left = `${note.x + px - 3}px`;
+      box.style.top = `${note.y - 4}px`;
+      box.style.width = `${note.w + 6}px`;
+      box.style.height = `${note.h + 8}px`;
+    }
+    if (Math.abs(px - this.lastStaffPx) < 0.05) return;
+    this.lastStaffPx = px;
+    $('tabStaffTrack').style.transform = `translateX(${px}px)`;
+  }
+
+  /** The single marker line down through both boxes, tracing the engraved tab's real cursor (same
+   * left edge, same width) rather than a separate thin line at its own guessed position — before
+   * this, the two didn't actually agree on where "now" was (see updateTabStaff). Shown only when
+   * both boxes are visible. */
+  private syncTimelineCursor(atSomething: boolean, stripCursor: DOMRect | null) {
+    const joined = !$('tabStrip').hidden && !$('tabStaff').hidden;
+    $('tabTimeline').classList.toggle('joined', joined);
+    const el = $('tabTimelineCursor');
+    el.hidden = !joined || !atSomething;
+    if (!el.hidden && stripCursor) {
+      const wrap = $('tabTimeline').getBoundingClientRect();
+      el.style.left = `${stripCursor.left - wrap.left}px`;
+      el.style.width = `${stripCursor.width}px`;
+    }
+  }
+
+  private stripPos = 0;
+  /** The playhead for the strip: extrapolated between reports for smooth motion, and never nudged
+   * backwards by the small correction the next report brings (a real jump, like a seek, does go back). */
+  private smoothStripPos(): number {
+    const p = this.player;
+    if (!p.state.playing) return (this.stripPos = p.state.pos);
+    const est = p.smoothPos();
+    if (!(est < this.stripPos && this.stripPos - est < SR * 0.15)) this.stripPos = est;
+    return this.stripPos;
+  }
+
+  /** The position the tab views are actually centred on: where playback is, plus any manual scroll.
+   * That scroll is dropped the moment playback itself moves (playing, seeking, scrubbing), so the view
+   * never gets stranded away from the music — it's a look-around while stopped, not a second position. */
+  private viewCoord(coord: number): number {
+    if (this.tabPan !== 0 && Math.abs(coord - this.tabPanAt) > 0.01) this.tabPan = 0;
+    return coord + this.tabPan;
+  }
+
+  /** Slides the engraved tab past its fixed cursor in step with the music, and highlights the
+   * fret(s)/note actually sounding right now — the read-only view the Tab pane shows once Follow
+   * along is on. Same pattern as updateTabStaff just above (that one optional, full staff). */
+  private updateTabStrip() {
+    const layout = this.stripLayout;
+    if (!layout || $('tabStrip').hidden) return;
+    const coord = this.coordAt(this.smoothStripPos() / SR);
+    const stripView = $('tabStripView');
+    const holdAt = stripView.clientWidth * 0.4; // matches .tab-staff-cursor's left: 40%
+    const x = coord === null ? 0 : staffX(layout.map, this.viewCoord(coord));
+    const px = coord === null ? 0 : holdAt - x;
+    $('tabStripCursor').style.left = `${holdAt}px`;
+    $('tabStripCursor').hidden = coord === null;
+    const note = coord === null ? null : noteAt(layout.notes, coord);
+    const box = $('tabStripNoteBox');
+    box.hidden = !note;
+    if (note) {
+      box.style.left = `${note.x + px - 3}px`;
+      box.style.top = `${note.y - 4}px`;
+      box.style.width = `${note.w + 6}px`;
+      box.style.height = `${note.h + 8}px`;
+    }
+    // The note picked for rhythm editing (see tabStripTrack's own click handler) — looked up by bar
+    // + col, not kept as the note object itself, so it still finds its box after a redraw moves
+    // everything (a new length changes that note's own width, and can reflow the notes after it).
+    const sel = this.selectedRhythmNote;
+    const editNote = sel ? layout.notes.find((n) => n.bar === sel.bar && n.col === sel.col) : undefined;
+    const editBox = $('tabStripEditBox');
+    editBox.hidden = !editNote;
+    if (editNote) {
+      editBox.style.left = `${editNote.x + px - 3}px`;
+      editBox.style.top = `${editNote.y - 4}px`;
+      editBox.style.width = `${editNote.w + 6}px`;
+      editBox.style.height = `${editNote.h + 8}px`;
+    }
+    if (Math.abs(px - this.lastStripPx) < 0.05) return;
+    this.lastStripPx = px;
+    $('tabStripTrack').style.transform = `translateX(${px}px)`;
+  }
+
+  // ---------- scratchpad parts: Guitar / Bass / Drums, each linked to its track ----------
+
+  /** The open part is the drums, so the tab editor holds a drum grid, drawn as a percussion staff. */
+  private isDrums(): boolean {
+    return this.activeTabPart() === 'drums';
+  }
+
+  /** The open part's text as timed notes and bars: a drum grid or a guitar-style tab. */
+  private parseActive(text: string) {
+    return this.isDrums() ? parseDrums(text) : parseScore(text);
+  }
+
+  /** The tab part the (single) tab editor currently holds. */
+  private activeTabPart(): TabPartId {
+    return this.scratch.tabPart ?? 'guitar';
+  }
+
+  /** The part whose tab is showing, or null on Lyrics / Notes. */
+  private currentPart(): PartId | null {
+    return this.scratchTab === 'tab' ? this.activeTabPart() : this.scratchTab === 'drums' ? 'drums' : null;
+  }
+
+  /** Every part, in tab order: Guitar, Bass, Drums, then the ones the user added. */
+  private allParts(): { id: PartId; name: string }[] {
+    return [...PART_IDS.map((id) => ({ id, name: this.partName(id) })), ...(this.scratch.extraParts ?? []).map((p) => ({ id: p.id, name: p.name }))];
+  }
+
+  private partName(id: PartId): string {
+    const extra = this.scratch.extraParts?.find((p) => p.id === id);
+    if (extra) return extra.name;
+    return this.scratch.partNames?.[id]?.trim() || DEFAULT_PART_NAMES[id] || id;
+  }
+
+  /** The text of a part's tab, wherever it is kept (the editor, for the open part; the stash for the other). */
+  private partText(id: PartId): string {
+    return (id === this.activeTabPart() ? this.scratch.tab : this.scratch.tabParts?.[id]?.tab) ?? '';
+  }
+
+  /** Changes which part (guitar or bass) the tab editor holds: the open part's state is put away and the other's brought back. */
+  private switchTabPart(next: TabPartId) {
+    const cur = this.activeTabPart();
+    if (next === cur) return;
+    this.resetTrainerTally(); // finishes the bar in progress into the part it was played in
+    const stash: Record<string, unknown> = {};
+    for (const k of TAB_FIELDS) if (this.scratch[k] !== undefined) stash[k] = this.scratch[k];
+    this.scratch.tabParts = { ...this.scratch.tabParts, [cur]: stash };
+    const incoming = (this.scratch.tabParts[next] ?? {}) as Record<string, unknown>;
+    for (const k of TAB_FIELDS) {
+      if (incoming[k] === undefined) delete this.scratch[k];
+      else (this.scratch as Record<string, unknown>)[k] = incoming[k];
+    }
+    delete this.scratch.tabParts[next];
+    this.scratch.tabPart = next;
+    if (next === 'guitar') delete this.scratch.tabPart; // guitar is the default, not stored
+    this.showTabText();
+    this.tabTimeline = null;
+    this.stripText = null;
+    this.staffText = null;
+    this.selectedTap = null;
+    this.selectedRhythmNote = null;
+    this.lastLoopBar = null;
+    this.updateTabView();
+    this.paintBarScores();
+    this.updateScratchSummary();
+    this.emit();
+  }
+
+  /** Puts the open part's text in the tab editor: its own, or a blank template (four strings for the bass). */
+  private showTabText() {
+    const ta = this.scratchAreas.tab;
+    const part = this.activeTabPart();
+    // Blank templates: the drum grid for the drums, four strings for the bass, six for everything else.
+    const blank = part === 'drums' ? this.scratchAreas.drums.placeholder : part === 'bass' ? ta.placeholder.split('\n').slice(2).join('\n') : ta.placeholder;
+    ta.value = this.scratch.tab || blank;
+  }
+
+  /** The track a part is linked to: the one chosen, else the default match by name. */
+  private partTrackName(id: PartId): string | undefined {
+    const chosen = this.scratch.partTracks?.[id];
+    if (chosen !== undefined) return chosen || undefined;
+    return defaultTrack(id, this.lanes.map((l) => l.name), this.partName(id));
+  }
+
+  private partLane(id: PartId): Lane | undefined {
+    const name = this.partTrackName(id);
+    return name === undefined ? undefined : this.lanes.find((l) => l.name === name);
+  }
+
+  /** Brings the part tabs, the track link and the track list in line with the state: names, which is open, what it is linked to. */
+  private updatePartUi() {
+    if (!this.partBtns) return;
+    const open = this.currentPart();
+    this.renderExtraParts();
+    for (const { id } of this.allParts()) {
+      const btn = this.partBtns[id];
+      if (!btn) continue;
+      btn.textContent = this.partName(id);
+      pressed(btn, id === open);
+    }
+    $('partDeleteBtn').hidden = !open || isBuiltinPart(open);
+    const link = $('partLink');
+    link.hidden = !open;
+    const lane = open ? this.partLane(open) : undefined;
+    if (open && this.partTrackDd) {
+      this.partTrackDd.setOptions([{ value: '', label: '(none)' }, ...this.lanes.map((l) => ({ value: l.name, label: laneLabel(l) }))]);
+      this.partTrackDd.value = lane?.name ?? '';
+      const mute = $<HTMLButtonElement>('partMuteBtn');
+      mute.hidden = !lane;
+      mute.textContent = `Play without ${this.partName(open)}`;
+      mute.title = lane ? `Mute ${laneLabel(lane)} so you play this part yourself` : '';
+      pressed(mute, !!lane?.mute);
+    }
+    for (const l of this.lanes) {
+      l.el.classList.toggle('part-linked', !!open && l === lane);
+      const linked = this.allParts().map((p) => p.id).filter((id) => this.partLane(id) === l);
+      if (l.tabBtn) {
+        l.tabBtn.hidden = linked.length === 0;
+        l.tabBtn.title = linked.length ? `Open the ${linked.map((id) => this.partName(id)).join(' / ')} tab` : '';
+      }
+    }
+  }
+
+  /** A track's Tab button: opens the Scratchpad on the first part linked to it. */
+  private openPartForLane(lane: Lane) {
+    const id = this.allParts().map((p) => p.id).find((p) => this.partLane(p) === lane);
+    if (!id) return;
+    this.openDrawer('scratch');
+    this.showPart(id);
+  }
+
+  /** Double-click on a part's tab: rename it in place (an empty name goes back to the default). */
+  private renamePart(id: PartId) {
+    const btn = this.partBtns[id];
+    const input = h('input', { class: 'part-rename', type: 'text', value: this.partName(id), maxLength: 20 });
+    let done = false;
+    const finish = (commit: boolean) => {
+      if (done) return;
+      done = true;
+      const name = input.value.trim();
+      if (commit) {
+        const extra = this.scratch.extraParts?.find((p) => p.id === id);
+        if (extra) {
+          if (name) extra.name = name; // an added part can't have no name
+        } else {
+          const names = { ...this.scratch.partNames };
+          if (!name || name === DEFAULT_PART_NAMES[id]) delete names[id];
+          else names[id] = name;
+          if (Object.keys(names).length) this.scratch.partNames = names;
+          else delete this.scratch.partNames;
+        }
+        this.emit();
+      }
+      input.replaceWith(btn);
+      this.updatePartUi();
+      this.updateScratchSummary();
+    };
+    input.onkeydown = (e) => {
+      e.stopPropagation();
+      if (e.key === 'Enter') finish(true);
+      if (e.key === 'Escape') finish(false);
+    };
+    input.onblur = () => finish(true);
+    btn.replaceWith(input);
+    input.focus();
+    input.select();
+  }
+
+  /** Makes (or re-makes) the buttons for the parts the user added, between Drums and the + button. */
+  private renderExtraParts() {
+    const extras = this.scratch.extraParts ?? [];
+    for (const id of Object.keys(this.partBtns)) {
+      if (!isBuiltinPart(id) && !extras.some((p) => p.id === id)) {
+        this.partBtns[id].remove();
+        delete this.partBtns[id];
+      }
+    }
+    for (const p of extras) {
+      if (this.partBtns[p.id]) continue;
+      const btn = h('button', { class: 'btn tiny ghost toggle', type: 'button', 'aria-pressed': 'false', title: 'Double-click to rename' }, p.name);
+      this.addPartBtn.before(btn);
+      this.partBtns[p.id] = btn;
+      this.wirePartButton(p.id, btn);
+    }
+  }
+
+  private wirePartButton(id: PartId, btn: HTMLButtonElement) {
+    btn.onclick = () => this.showPart(id);
+    btn.ondblclick = () => this.renamePart(id);
+  }
+
+  /** The + button: a new part (a second guitar, keys, …), opened ready to be named. */
+  private addPart() {
+    const extras = this.scratch.extraParts ?? [];
+    const id = newPartId(extras);
+    this.scratch.extraParts = [...extras, { id, name: `Part ${extras.length + 4}` }];
+    this.renderExtraParts();
+    this.showPart(id);
+    this.emit();
+    this.renamePart(id);
+  }
+
+  /** Removes a part the user added, with whatever tab is in it (after asking, if there is anything in it). */
+  private deletePart(id: PartId) {
+    const extra = this.scratch.extraParts?.find((p) => p.id === id);
+    if (!extra) return;
+    if (this.partText(id).trim() && !confirm(`Delete the ${extra.name} tab and everything in it? This can't be undone.`)) return;
+    if (this.activeTabPart() === id) this.showPart('guitar'); // puts this part's state away, bringing guitar back
+    if (this.scratch.tabParts) delete this.scratch.tabParts[id];
+    if (this.scratch.partTracks) delete this.scratch.partTracks[id];
+    const rest = (this.scratch.extraParts ?? []).filter((p) => p.id !== id);
+    if (rest.length) this.scratch.extraParts = rest;
+    else delete this.scratch.extraParts;
+    this.updatePartUi();
+    this.updateScratchSummary();
+    this.emit();
+  }
+
+  private updateScratchSummary() {
+    const bits = [
+      this.scratch.lyrics ? 'Lyrics' : '',
+      ...this.allParts().filter((p) => this.partText(p.id).trim()).map((p) => p.name),
+      this.scratch.notes ? 'Notes' : '',
+    ].filter(Boolean);
+    const sum = $('sumScratch');
+    sum.textContent = bits.join(' · ');
+    sum.classList.toggle('on', bits.length > 0);
+  }
+
+  /** External navigation never includes the private song title. */
+  private updateLyricsLink() {
+    ($('lyricsSearchLink') as HTMLAnchorElement).href = 'https://genius.com/search';
+  }
+
+  // ---------- collapsible "Practice" / "Tempo & key" drawer ----------
+  private initDrawer() {
+    const tabs = [...document.querySelectorAll<HTMLButtonElement>('.dtab')];
+    const open = (name: string | null) => {
+      for (const t of tabs) t.setAttribute('aria-expanded', String(t.dataset.tab === name));
+      for (const p of document.querySelectorAll<HTMLElement>('.dpane')) {
+        // A floating Scratchpad is a separate window at this point (position:fixed, not part of the
+        // drawer's normal layout); it stays up regardless of which drawer tab is open underneath it.
+        if (p.dataset.pane === 'scratch' && p.classList.contains('floating')) continue;
+        p.hidden = p.dataset.pane !== name;
+      }
+      try {
+        localStorage.setItem('steminize.drawer', name ?? '');
+      } catch {
+        /* ignore */
+      }
+    };
+    this.openDrawer = open;
+    for (const t of tabs) t.onclick = () => open(t.getAttribute('aria-expanded') === 'true' ? null : t.dataset.tab!);
+    let saved = '';
+    try {
+      saved = localStorage.getItem('steminize.drawer') ?? '';
+    } catch {
+      /* ignore */
+    }
+    open(saved || null);
+  }
+
+  /** Scratchpad, popped out into a free-floating, draggable, resizable window (position:fixed) that
+   * stays up regardless of drawer navigation, instead of being confined to the drawer's own space. */
+  private initScratchFloat() {
+    const pane = document.querySelector<HTMLElement>('.dpane[data-pane="scratch"]')!;
+    // The whole bar is the drag surface (like a native window title bar), not just the small
+    // "⠿ Scratchpad" text inside it — that text span only covers its own width, so dragging from
+    // the rest of the bar (which visually looks just as draggable, via its own cursor:move CSS)
+    // fell through to the page underneath and dragged/selected text there instead.
+    const handle = $('scratchFloatBar');
+    const resizeHandle = $('scratchResizeHandle');
+    const KEY = 'steminize.scratchFloat';
+    const clamp = (v: number, lo: number, hi: number) => Math.min(Math.max(v, lo), Math.max(lo, hi));
+    // Marks the pane's normal spot in the drawer, so docking can put it back exactly there.
+    const anchor = document.createComment('scratch-pane-anchor');
+    pane.after(anchor);
+
+    const place = (left: number, top: number) => {
+      pane.style.left = `${clamp(left, 8, innerWidth - pane.offsetWidth - 8)}px`;
+      pane.style.top = `${clamp(top, 8, innerHeight - pane.offsetHeight - 8)}px`;
+    };
+    const resizeTo = (width: number, height: number) => {
+      pane.style.width = `${clamp(width, 300, innerWidth - 16)}px`;
+      pane.style.height = `${clamp(height, 240, innerHeight - 16)}px`;
+      place(pane.offsetLeft, pane.offsetTop); // a growing panel can't be left hanging off the edge
+    };
+    const save = () => {
+      try {
+        const floating = pane.classList.contains('floating');
+        // Only overwrite the saved position/size while actually floating and rendered (offsetWidth
+        // is 0 otherwise — hidden, or #deck itself not open yet); keep the last good ones the rest
+        // of the time, so docking (or a call before there's anything to measure) doesn't zero them
+        // out and leave the next Float click restoring to a zero-sized panel in the corner.
+        const geo =
+          floating && pane.offsetWidth > 0
+            ? { left: pane.offsetLeft, top: pane.offsetTop, width: pane.offsetWidth, height: pane.offsetHeight }
+            : { left: load()?.left ?? 0, top: load()?.top ?? 0, width: load()?.width ?? 420, height: load()?.height ?? 480 };
+        localStorage.setItem(KEY, JSON.stringify({ floating, ...geo }));
+      } catch {
+        /* ignore */
+      }
+    };
+    const load = (): { floating: boolean; left: number; top: number; width: number; height: number } | null => {
+      try {
+        const raw = localStorage.getItem(KEY);
+        return raw ? JSON.parse(raw) : null;
+      } catch {
+        return null;
+      }
+    };
+
+    const setFloating = (on: boolean) => {
+      pane.classList.toggle('floating', on);
+      if (on) {
+        // Moved to be a direct child of <body> rather than trusting position:fixed to escape every
+        // ancestor on its own: it should (nothing here sets transform/filter/contain, the usual
+        // reasons it wouldn't), but WebKitGTK visibly clipped/constrained it to the pinned top area
+        // regardless. As a real child of <body> there is no ancestor left to disagree about it.
+        document.body.appendChild(pane);
+        const s = load();
+        pane.style.width = `${s?.width ?? 420}px`;
+        pane.style.height = `${s?.height ?? 480}px`;
+        pane.hidden = false;
+        place(s?.left ?? innerWidth - 460, s?.top ?? 100);
+      } else {
+        anchor.after(pane); // back to its normal spot in the drawer
+        pane.style.left = pane.style.top = pane.style.width = pane.style.height = '';
+        // Undocking makes it an ordinary drawer pane again: only actually showing if its tab is the open one.
+        pane.hidden = document.querySelector('.dtab[data-tab="scratch"]')?.getAttribute('aria-expanded') !== 'true';
+      }
+      save();
+    };
+    $('scratchFloatBtn').onclick = () => setFloating(true);
+    $('scratchDockBtn').onclick = () => setFloating(false);
+
+    // Listening on `document` rather than just the handle/resize grip is deliberate, not just
+    // setPointerCapture: dragging was intermittent in WebKitGTK, plausibly from the same root cause
+    // as the clipping above (the panel's real rendered position disagreeing with an ancestor), and
+    // capture alone would go quiet if that happened mid-drag. document-level listeners, gated on the
+    // drag/resize state below rather than which element the pointer is actually over, don't depend
+    // on that relationship being reliable — they keep working even if capture itself misbehaves.
+    let drag: { x: number; y: number; left: number; top: number } | null = null;
+    handle.addEventListener('pointerdown', (e) => {
+      if ((e.target as HTMLElement).closest('button')) return; // let the Dock button handle its own click
+      e.preventDefault();
+      // Capture is a nice-to-have (keeps events coming even if the pointer leaves the handle mid-
+      // drag); the document-level listeners above don't depend on it, so a browser that refuses it
+      // for some reason shouldn't stop dragging from working.
+      try {
+        handle.setPointerCapture(e.pointerId);
+      } catch {
+        /* ignore */
+      }
+      drag = { x: e.clientX, y: e.clientY, left: pane.offsetLeft, top: pane.offsetTop };
+    });
+    document.addEventListener('pointermove', (e) => {
+      if (drag) place(drag.left + (e.clientX - drag.x), drag.top + (e.clientY - drag.y));
+    });
+    const endDrag = () => {
+      if (!drag) return;
+      drag = null;
+      save();
+    };
+    document.addEventListener('pointerup', endDrag);
+    document.addEventListener('pointercancel', endDrag);
+
+    let resize: { x: number; y: number; w: number; h: number } | null = null;
+    resizeHandle.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      try {
+        resizeHandle.setPointerCapture(e.pointerId);
+      } catch {
+        /* ignore */
+      }
+      resize = { x: e.clientX, y: e.clientY, w: pane.offsetWidth, h: pane.offsetHeight };
+    });
+    document.addEventListener('pointermove', (e) => {
+      if (resize) resizeTo(resize.w + (e.clientX - resize.x), resize.h + (e.clientY - resize.y));
+    });
+    const endResize = () => {
+      if (!resize) return;
+      resize = null;
+      save();
+    };
+    document.addEventListener('pointerup', endResize);
+    document.addEventListener('pointercancel', endResize);
+
+    // Belt and braces alongside endResize()'s own save() above, in case the panel's size ever
+    // changes some other way.
+    new ResizeObserver(() => pane.classList.contains('floating') && save()).observe(pane);
+    window.addEventListener('resize', () => pane.classList.contains('floating') && place(pane.offsetLeft, pane.offsetTop));
+
+    this.restoreScratchFloat = () => {
+      if (load()?.floating) setFloating(true);
+    };
+  }
+
+  /** One-line summaries on the drawer tabs, so closed panels still show what's on. */
+  private updateDrawerSummary() {
+    const p = this.pr;
+    const bits = [
+      p.trainer.on ? `Trainer ${Math.round(p.trainer.from * 100)}→${Math.round(p.trainer.to * 100)}%` : '',
+      p.gap ? `Gap ${p.gap} s` : '',
+      p.countIn ? 'Count-in' : '',
+      p.click ? 'Click' : '',
+    ].filter(Boolean);
+    const sp = $('sumPractice');
+    sp.textContent = bits.length ? bits.join(' · ') : 'off';
+    sp.classList.toggle('on', bits.length > 0);
+    const a = this.r?.analysis;
+    const k = a?.key;
+    $('sumBeat').textContent = this.pr.beatMode === 'manual' ? `${this.pr.manualBpm} BPM · 手動` : a?.beats.length ? [`${Math.round(a.bpm)} BPM`, k ? keyName(k, this.pitch) : ''].filter(Boolean).join(' · ') : 'analysing…';
+  }
+
+  private practiceChanged() {
+    $('deck').classList.toggle('no-beats', !this.beatSeconds().length);
+    this.syncPracticeUi();
+    this.sendPractice();
+    this.invalidateLayers();
+    this.emit();
+  }
+
+  private initPractice() {
+    $('trainerBtn').onclick = () => {
+      const t = this.pr.trainer;
+      t.on = !t.on;
+      this.resetGate();
+      if (t.on) {
+        if (!this.loop.on) this.setLoop(true);
+        this.tempo = t.from; // the player also resets to this
+        this.showTempoPitch();
+      }
+      this.practiceChanged();
+    };
+    const num = (id: string, f: (v: number) => void) => ($<HTMLInputElement>(id).onchange = (e) => {
+      const v = Number((e.target as HTMLInputElement).value);
+      if (Number.isFinite(v) && v > 0) f(v);
+      this.practiceChanged();
+    });
+    num('trFrom', (v) => (this.pr.trainer.from = Math.min(1.5, Math.max(0.3, v / 100))));
+    num('trTo', (v) => (this.pr.trainer.to = Math.min(1.5, Math.max(0.3, v / 100))));
+    num('trStep', (v) => (this.pr.trainer.step = Math.min(0.25, v / 100)));
+    num('trEvery', (v) => (this.pr.trainer.every = Math.round(v)));
+    // Gated speed-up: the checkbox turns it on at the number's accuracy; the number alone only matters while it's on.
+    const gateAcc = () => Math.min(1, Math.max(0.5, Number($<HTMLInputElement>('trGateAcc').value) / 100 || 0.9));
+    $<HTMLInputElement>('trGate').onchange = (e) => {
+      this.pr.trainer.gate = (e.target as HTMLInputElement).checked ? gateAcc() : 0;
+      this.resetGate();
+      this.practiceChanged();
+    };
+    $<HTMLInputElement>('trGateAcc').onchange = () => {
+      if (this.pr.trainer.gate) this.pr.trainer.gate = gateAcc();
+      this.practiceChanged();
+    };
+    $('countInBtn').onclick = () => ((this.pr.countIn = !this.pr.countIn), this.practiceChanged());
+    $('clickBtn').onclick = () => ((this.pr.click = !this.pr.click), this.practiceChanged());
+    $<HTMLInputElement>('clickVol').oninput = (e) => ((this.pr.clickVol = Number((e.target as HTMLInputElement).value)), this.practiceChanged());
+    $<HTMLSelectElement>('gap').onchange = (e) => ((this.pr.gap = Number((e.target as HTMLSelectElement).value)), this.practiceChanged());
+    $<HTMLSelectElement>('snap').onchange = (e) => ((this.pr.snap = (e.target as HTMLSelectElement).value as Snap), this.practiceChanged());
+    $<HTMLSelectElement>('perBar').onchange = (e) => {
+      this.pr.perBar = Number((e.target as HTMLSelectElement).value);
+      this.pr.barShift = 0;
+      this.practiceChanged();
+    };
+    $('shiftBar').onclick = () => ((this.pr.barShift = (this.pr.barShift + 1) % this.pr.perBar), this.practiceChanged());
+    $('halfBtn').onclick = () => this.r?.analysis && void this.retempo(this.r.analysis.bpm / 2);
+    $('dblBtn').onclick = () => this.r?.analysis && void this.retempo(this.r.analysis.bpm * 2);
+    $('tapBtn').onclick = () => {
+      const now = performance.now();
+      if (this.taps.length && now - this.taps[this.taps.length - 1] > 2500) this.taps = [];
+      this.taps.push(now);
+      const btn = $('tapBtn');
+      btn.classList.add('tap-on');
+      setTimeout(() => btn.classList.remove('tap-on'), 90);
+      const n = this.taps.length;
+      if (n < 4) {
+        btn.textContent = `Tap (${4 - n} more)`;
+        return;
+      }
+      const bpm = (60000 * (n - 1)) / (this.taps[n - 1] - this.taps[0]);
+      btn.textContent = `Tap · ${Math.round(bpm)}`;
+      // Tapping is at the playback speed; the song's tempo is that divided by it.
+      clearTimeout((this as any).tapTimer);
+      (this as any).tapTimer = setTimeout(() => {
+        btn.textContent = 'Tap';
+        this.taps = [];
+        void this.retempo(bpm / this.tempo);
+      }, 1200);
+    };
+  }
+
+  /** Re-track beats at a corrected tempo. */
+  private async retempo(bpm: number) {
+    const r = this.r;
+    if (!r || bpm < 30 || bpm > 300) return;
+    if (this.beatMode === 'manual') { this.pr.manualBpm = boundedBpm(bpm); this.practiceChanged(); return; }
+    this.updateBpmInfo(true);
+    try {
+      r.onsets ??= await this.needOnsets(r);
+      if (this.r !== r || this.beatMode !== 'auto') return;
+      const a = retrack(r.onsets, periodForBpm(bpm), this.pr.perBar);
+      this.pr.barShift = 0;
+      this.setAnalysis({ ...r.analysis, bpm: a.bpm, beats: a.beats, downbeat: a.downbeat });
+      this.onAnalysisChange(r);
+      this.practiceChanged();
+    } catch (e) {
+      toast(`Couldn't re-analyse: ${(e as Error).message}`, true);
+      this.updateBpmInfo();
+    }
+  }
+
+  /** Snap a frame position to the nearest beat or bar start. */
+  private snap(pos: number) {
+    const beats = this.beatFrames();
+    if (this.pr.snap === 'off' || !beats.length) return pos;
+    const d = this.downbeat();
+    const grid = this.pr.snap === 'bar' ? beats.filter((_, i) => (i - d) % this.pr.perBar === 0) : beats;
+    let best = pos;
+    let dist = Infinity;
+    for (const b of grid) if (Math.abs(b - pos) < dist) [best, dist] = [b, Math.abs(b - pos)];
+    return best;
+  }
+
+  /** Sets the section being dragged out, already snapped, so the highlight jumps bar to bar under the
+   * pointer and shows what you'll get. If both ends would land on the same point, the raw span is kept. */
+  private dragSection(rawA: number, rawB: number) {
+    const a = this.snap(rawA);
+    const b = this.snap(rawB);
+    const snapped = b > a;
+    this.loop.a = Math.round(snapped ? a : rawA);
+    this.loop.b = Math.round(snapped ? b : rawB);
+    this.dirty = true;
+  }
+
+  private snapLoop() {
+    const a = this.snap(this.loop.a);
+    let b = this.snap(this.loop.b);
+    if (b <= a) b = this.loop.b; // keep a sensible region if both snap to the same point
+    this.loop.a = a;
+    this.loop.b = b;
+  }
+
+  close() {
+    this.stopLiveInputUi();
+    this.player.pause();
+    this.r = null;
+    this.media.setSong(null);
+    this.lanes = [];
+    this.laneUndo = [];
+    this.laneRedo = [];
+    this.fadeMul = 1;
+    this.fadeToken++;
+    this.lastPracticeTick = null;
+    $('deck').hidden = true;
+    $('welcome').hidden = false;
+    this.practicePanel?.render();
+  }
+
+  // ---------- mixer ----------
+  /** An overall multiplier on top of every lane's own gain, for fadeVolume() — the mixer itself
+   * (mute/solo/vol) is untouched, so a fade never disturbs what the user actually set. */
+  private fadeMul = 1;
+  private fadeToken = 0;
+  private gains() {
+    const anySolo = this.lanes.some((l) => l.solo);
+    return this.lanes.map((l) => (anySolo ? (l.solo ? l.vol : 0) : l.mute ? 0 : l.vol) * this.fadeMul);
+  }
+
+  /** Smoothly ramps overall playback volume to `target` (0-1) over `ms` — e.g. a setlist fading
+   * songs in/out around an auto-advance, instead of a hard cut. ms<=0 jumps immediately (useful to
+   * silence a just-opened song before its first audible frame, ahead of a fade-in). A later call
+   * pre-empts one still in progress, ramping on from wherever it currently is. */
+  fadeVolume(target: number, ms: number): Promise<void> {
+    const token = ++this.fadeToken;
+    const start = this.fadeMul;
+    const t0 = performance.now();
+    return new Promise((resolve) => {
+      const step = (t: number) => {
+        if (token !== this.fadeToken) return resolve(); // superseded by a newer fade
+        const p = ms <= 0 ? 1 : Math.min(1, (t - t0) / ms);
+        this.fadeMul = start + (target - start) * p;
+        this.player.setGains(this.gains(), this.pans(), this.eqs());
+        if (p < 1) requestAnimationFrame(step);
+        else resolve();
+      };
+      requestAnimationFrame(step);
+    });
+  }
+
+  private pans() {
+    return this.lanes.map((l) => l.pan);
+  }
+
+  private eqs() {
+    return this.lanes.map((l) => l.eq);
+  }
+
+  /** Open/close a stem's EQ panel (one open at a time). */
+  private toggleEq(l: Lane, colour: string) {
+    const open = !!l.eqPanel?.el.isConnected;
+    for (const x of this.lanes) {
+      x.eqPanel?.el.remove();
+      x.el.classList.remove('eq-open');
+    }
+    if (open) return;
+    l.eqPanel ??= eqPanel(
+      colour,
+      (eq) => this.setLane(l, { eq }),
+      (before, after) => this.pushLaneHistory(l, { eq: before }, { eq: after }),
+    );
+    if (l.eq) l.eqPanel.set(l.eq);
+    l.el.append(l.eqPanel.el);
+    l.el.classList.add('eq-open');
+    requestAnimationFrame(() => l.eqPanel!.redraw());
+  }
+
+  private setLane(l: Lane, patch: LanePatch) {
+    Object.assign(l, patch);
+    this.dirty = true;
+    this.emit();
+    pressed(l.el.querySelector('.m')!, l.mute);
+    pressed(l.el.querySelector('.s')!, l.solo);
+    const g = this.gains();
+    this.lanes.forEach((x, i) => x.el.classList.toggle('off', g[i] === 0));
+    this.player.setGains(g, this.pans(), this.eqs());
+    for (const x of this.lanes) x.el.querySelector('.eq')!.classList.toggle('on', !isFlat(x.eq));
+    // If pan is hidden but in use, say so on the button so it isn't forgotten.
+    $('panToggle').textContent = this.lanes.some((x) => x.pan) ? 'Pan (active)' : 'Pan';
+    this.updatePartUi(); // the part's "play without it" button follows its track's mute
+  }
+
+  /** setLane, but also records one undo step. Use for discrete, one-shot changes (a mute/solo
+   * click, an EQ preset). A continuous gesture (dragging a slider) should call setLane directly for
+   * live feedback and record its own single step on release — see the vol/pan/EQ wiring below. */
+  private setLaneRecorded(l: Lane, patch: LanePatch) {
+    const before = {} as LanePatch;
+    for (const k of Object.keys(patch) as (keyof LanePatch)[]) (before as any)[k] = l[k];
+    this.setLane(l, patch);
+    this.pushLaneHistory(l, before, patch);
+  }
+
+  private pushLaneHistory(lane: Lane, before: LanePatch, after: LanePatch) {
+    const unchanged =
+      'eq' in after ? (before.eq && after.eq ? sameEq(before.eq, after.eq) : before.eq === after.eq) : Object.keys(after).every((k) => (before as any)[k] === (after as any)[k]);
+    if (unchanged) return;
+    this.laneUndo.push({ lane, before, after });
+    if (this.laneUndo.length > 200) this.laneUndo.shift();
+    this.laneRedo = [];
+  }
+
+  /** setLane doesn't touch the vol/pan <input type=range> elements themselves — normally unnecessary,
+   * since it's only ever called from those same sliders' own 'input' handlers (already at the right
+   * position) or from a button/EQ panel with no slider of its own to sync. Undo/redo is the one
+   * caller that changes vol/pan from outside the slider, so it has to sync them back explicitly.
+   * The synthetic 'focus' dispatch re-primes that slider's own gesture-start tracking (see buildLane)
+   * to the new value — otherwise undoing, then immediately dragging that same still-focused slider
+   * again without ever un-focusing it, would diff against the pre-undo value instead of this one. */
+  private syncLaneSliders(l: Lane, patch: LanePatch) {
+    const [volEl, panEl] = l.el.querySelectorAll('input[type=range]') as unknown as [HTMLInputElement, HTMLInputElement];
+    if ('vol' in patch) {
+      volEl.value = String(l.vol);
+      volEl.dispatchEvent(new Event('focus'));
+    }
+    if ('pan' in patch) {
+      panEl.value = String(l.pan);
+      const panOut = l.el.querySelector('.mini.pan output');
+      if (panOut) panOut.textContent = l.pan === 0 ? 'C' : `${l.pan < 0 ? 'L' : 'R'}${Math.round(Math.abs(l.pan) * 100)}`;
+      panEl.dispatchEvent(new Event('focus'));
+    }
+    if ('eq' in patch) l.eqPanel?.set(l.eq ?? FLAT); // undo can go back to "never touched" (eq undefined)
+  }
+
+  private undo() {
+    const entry = this.laneUndo.pop();
+    if (!entry) return;
+    this.setLane(entry.lane, entry.before);
+    this.syncLaneSliders(entry.lane, entry.before);
+    this.laneRedo.push(entry);
+  }
+
+  private redo() {
+    const entry = this.laneRedo.pop();
+    if (!entry) return;
+    this.setLane(entry.lane, entry.after);
+    this.syncLaneSliders(entry.lane, entry.after);
+    this.laneUndo.push(entry);
+  }
+
+  private selectLane(lane: Lane) {
+    if (this.selectedLane === lane) return;
+    this.selectedLane = lane;
+    for (const l of this.lanes) l.el.classList.toggle('selected', l === lane);
+  }
+
+  /** Renames a track for display/export only; chords, MIDI etc. still key off its real stem name. */
+  private renameLane(lane: Lane, nameBtn: HTMLButtonElement, dl: HTMLButtonElement) {
+    const input = h('input', { type: 'text', value: laneLabel(lane), maxLength: 40, class: 'name-edit', 'aria-label': 'Track name' } as any);
+    let done = false;
+    const finish = (save: boolean) => {
+      if (done) return;
+      done = true;
+      if (save) lane.label = input.value.trim() || undefined;
+      const badgeText = nameBtn.querySelector('.take-badge')?.textContent ?? '';
+      nameBtn.replaceChildren(laneLabel(lane), h('span', { class: 'take-badge muted' }, badgeText));
+      dl.title = `Save ${laneLabel(lane)}`;
+      input.replaceWith(nameBtn);
+      if (save) {
+        this.refreshTunerSources();
+        if (lane.recordGroup) this.refreshRecordTargetsUi();
+        this.emit();
+      }
+    };
+    input.onkeydown = (e) => {
+      e.stopPropagation();
+      if (e.key === 'Enter') finish(true);
+      if (e.key === 'Escape') finish(false);
+    };
+    input.onblur = () => finish(true);
+    nameBtn.replaceWith(input);
+    input.focus();
+    input.select();
+  }
+
+  /** The title is truncated with an ellipsis (see .deck-head h1 in styles.css) so it never pushes
+   * the Export/Save buttons off the row; the full name plus the rename hint live in the tooltip. */
+  private setTitleText(title: string) {
+    const heading = $('trackTitle');
+    heading.textContent = title;
+    heading.title = `${title} (double-click to rename)`;
+  }
+
+  private renameSong() {
+    if (!this.r) return;
+    const heading = $('trackTitle');
+    const input = h('input', { type: 'text', value: this.r.title, maxLength: 120, class: 'title-edit', 'aria-label': 'Song title' } as any);
+    let done = false;
+    const finish = (save: boolean) => {
+      if (done) return;
+      done = true;
+      const val = input.value.trim();
+      if (save && val && this.r) {
+        this.r.title = val;
+        this.onRename(val);
+      }
+      this.setTitleText(this.r?.title ?? '');
+      if (this.r) this.media.setSong(this.r.title);
+      input.replaceWith(heading);
+      this.updateLyricsLink();
+    };
+    input.onkeydown = (e) => {
+      e.stopPropagation();
+      if (e.key === 'Enter') finish(true);
+      if (e.key === 'Escape') finish(false);
+    };
+    input.onblur = () => finish(true);
+    heading.replaceWith(input);
+    input.focus();
+    input.select();
+  }
+
+  private setTempoPitch(tempo: number, pitch: number, save = true) {
+    this.tempo = tempo;
+    this.pitch = pitch;
+    this.showTempoPitch();
+    this.player.setTempoPitch(tempo, pitch);
+    this.dirty = true;
+    if (save) this.emit();
+  }
+
+  private showTempoPitch() {
+    $<HTMLInputElement>('tempo').value = String(this.tempo);
+    $<HTMLInputElement>('pitch').value = String(this.pitch);
+    $('tempoOut').textContent = `${Math.round(this.tempo * 100)}%`;
+    $('pitchOut').textContent = `${this.pitch > 0 ? '+' : ''}${this.pitch} st`;
+    this.updateBpmInfo();
+  }
+
+  // ---------- transport & loop ----------
+  toggle() {
+    if (!this.r) return;
+    if (this.player.state.playing) this.player.pause();
+    else void this.player.play();
+  }
+
+  private get length() {
+    return this.r?.stems[0].data[0].length ?? 0;
+  }
+
+  private seekFrac(f: number) {
+    this.player.seek(this.frameAt(Math.max(0, Math.min(1, f))));
+    this.dirty = true;
+  }
+
+  /** Where each tab-tap tag was last drawn on the overview (CSS px), for hit-testing pointer events. */
+  private tapTagRects: { charOffset: number; x0: number; x1: number; y0: number; y1: number }[] = [];
+  /** The tap picked by clicking its tag (by tab position, so it survives other taps being added). */
+  private selectedTap: number | null = null;
+  private tapDrag: { charOffset: number; x0: number; moved: boolean } | null = null;
+  /** The note picked by clicking it in Follow along, for setting its rhythm with w/h/q/e/s — by bar
+   * + column (see TabNote/TabScoreLayout.notes) rather than a DOM reference, so it survives the
+   * re-render that same key press causes (the note's new stem shape needs to show, still selected). */
+  private selectedRhythmNote: { bar: number; col: number } | null = null;
+  private lastGrain = 0;
+  /** Moves the playhead to `frame` while dragging, and, if the song isn't playing, sounds a short
+   * snippet from there so you can find a spot by ear (playing already makes the seek audible). */
+  private scrubTo(frame: number) {
+    if (this.player.recording) return; // seeking mid-take is refused anyway; don't repeat the warning per pointer move
+    // A live loop pins the playhead inside it, so scrubbing past its edge would just stick there.
+    // Scrubbing is how you look around, so leaving the section switches the loop off (the section
+    // itself stays marked; Loop turns it back on).
+    if (this.loop.on && this.loop.b > this.loop.a && (frame < this.loop.a || frame > this.loop.b)) {
+      this.setLoop(false);
+      toast('Loop switched off while you scrub outside it. Press Loop to turn it back on.');
+    }
+    this.player.seek(frame);
+    this.dirty = true;
+    const r = this.r;
+    if (!r || this.player.state.playing) return;
+    const now = performance.now();
+    if (now - this.lastGrain < 70) return;
+    this.lastGrain = now;
+    const start = Math.max(0, Math.min(this.length - 1, Math.round(frame)));
+    const n = Math.min(Math.round(SR * 0.1), this.length - start);
+    if (n <= 0) return;
+    const gains = this.gains();
+    const out = [new Float32Array(n), new Float32Array(n)];
+    r.stems.forEach((st, i) => {
+      const g = gains[i];
+      if (!g) return;
+      for (let ch = 0; ch < 2; ch++) {
+        const src = st.data[Math.min(ch, st.data.length - 1)];
+        for (let j = 0; j < n; j++) out[ch][j] += src[start + j] * g;
+      }
+    });
+    void this.player.scrubGrain(out);
+  }
+
+  /** Frame at a fraction across the visible (possibly zoomed) waveform. */
+  private frameAt(f: number) {
+    return this.view.start + f * (this.view.end - this.view.start);
+  }
+
+  // ---------- zoom ----------
+  private clampView(start: number, end: number) {
+    const len = this.length || 1;
+    const span = Math.min(len, Math.max(SR, end - start));
+    start = Math.max(0, Math.min(len - span, start));
+    return { start, end: start + span };
+  }
+
+  private setView(start: number, end: number) {
+    this.view = this.clampView(start, end);
+    const len = this.length || 1;
+    const span = this.view.end - this.view.start;
+    const zoomed = span < len - 1;
+    const scroll = $<HTMLInputElement>('viewScroll');
+    scroll.hidden = !zoomed;
+    if (zoomed) scroll.value = String(Math.round((1000 * this.view.start) / Math.max(1, len - span)));
+    this.invalidateLayers();
+  }
+
+  /** A track's own zoom, independent of the shared view and every other track's. */
+  private setLaneView(lane: Lane, start: number, end: number) {
+    lane.ownView = this.clampView(start, end);
+    lane.layers = undefined;
+    this.dirty = true;
+  }
+
+  /** Resets the shared view and every track's own zoom back to the whole song. */
+  private zoomFit() {
+    this.setView(0, this.length);
+    for (const l of this.lanes) {
+      l.ownView = undefined;
+      l.layers = undefined;
+    }
+    this.dirty = true;
+  }
+
+  private zoom(factor: number, centre = this.player.state.pos, lane?: Lane) {
+    const view = lane ? (lane.ownView ?? this.view) : this.view;
+    const span = view.end - view.start;
+    const next = span / factor;
+    const rel = span ? (centre - view.start) / span : 0.5;
+    const start = centre - rel * next;
+    if (lane) this.setLaneView(lane, start, start + next);
+    else this.setView(start, start + next);
+  }
+
+  private onWheel(e: WheelEvent, el: HTMLElement, lane?: Lane) {
+    if (!this.r) return;
+    e.preventDefault();
+    const view = lane ? (lane.ownView ?? this.view) : this.view;
+    const span = view.end - view.start;
+    if (e.shiftKey || Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
+      // Shift+wheel arrives as deltaY on some platforms and already turned into deltaX on others.
+      const d = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
+      const start = view.start + (d / el.clientWidth) * span;
+      const end = view.end + (d / el.clientWidth) * span;
+      if (lane) this.setLaneView(lane, start, end);
+      else this.setView(start, end);
+    } else {
+      const f = Math.max(0, Math.min(1, e.offsetX / el.clientWidth));
+      this.zoom(Math.exp(-e.deltaY * 0.002), view.start + f * span, lane);
+    }
+  }
+
+  // ---------- markers & pedal ----------
+  private initMarkersAndZoom() {
+    $('zoomIn').onclick = () => this.zoom(2);
+    $('zoomOut').onclick = () => this.zoom(0.5);
+    $('zoomFit').onclick = () => this.zoomFit();
+    $<HTMLInputElement>('viewScroll').oninput = (e) => {
+      const span = this.view.end - this.view.start;
+      const start = (Number((e.target as HTMLInputElement).value) / 1000) * (this.length - span);
+      this.setView(start, start + span);
+    };
+    $('overviewWrap').addEventListener('wheel', (e) => this.onWheel(e, $('overviewWrap')), { passive: false });
+    $('addMarker').onclick = () => this.addMarker();
+    const pedalBtn = $('pedalBtn');
+    try {
+      this.pedal = localStorage.getItem('steminize.pedal') === '1';
+    } catch {
+      /* ignore */
+    }
+    pressed(pedalBtn, this.pedal);
+    pedalBtn.onclick = () => {
+      this.pedal = !this.pedal;
+      pressed(pedalBtn, this.pedal);
+      try {
+        localStorage.setItem('steminize.pedal', this.pedal ? '1' : '0');
+      } catch {
+        /* ignore */
+      }
+      toast(this.pedal ? 'Foot pedal mode: right/down = play/pause, left/up = restart section' : 'Arrow keys skip 5 s again');
+    };
+  }
+
+  private addMarker() {
+    if (!this.r) return;
+    const pos = Math.round(this.snap(this.player.state.pos));
+    if (this.markers.some((m) => Math.abs(m.pos - pos) < SR / 4)) {
+      toast('There is already a marker here');
+      return;
+    }
+    // Numbered by default; rename with ✎ to "Verse", "Solo", etc.
+    const used = new Set(this.markers.map((m) => m.name));
+    let n = 1;
+    while (used.has(String(n))) n++;
+    const name = String(n);
+    this.markers.push({ name, pos });
+    this.markers.sort((a, b) => a.pos - b.pos);
+    this.markersChanged();
+  }
+
+  private markersChanged() {
+    this.renderMarkers();
+    this.invalidateLayers();
+    this.emit();
+  }
+
+  /** Index of the section the playhead is in (last marker at or before it). */
+  private sectionAt(pos: number) {
+    let idx = -1;
+    this.markers.forEach((m, i) => {
+      if (m.pos <= pos + SR / 20) idx = i;
+    });
+    return idx;
+  }
+
+  private renderMarkers() {
+    if (!$('keyPanel').hidden) this.refreshKeySectionBtn();
+    const here = this.sectionAt(this.player.state.pos);
+    $('markers').replaceChildren(
+      ...this.markers.map((m, i) => {
+        const go = h('button', { class: 'mk-go', type: 'button', title: `Jump to ${m.name} (${fmtTime(m.pos / SR)})` }, m.name);
+        const ren = h('button', { class: 'mk-ren', type: 'button', title: 'Rename' }, '✎');
+        const loop = h('button', { class: 'mk-loop', type: 'button', title: 'Loop this section' }, '⟳');
+        const del = h('button', { class: 'mk-del', type: 'button', title: 'Remove marker' }, '×');
+        // Single click jumps, but waits a moment so a double-click (rename) doesn't jump first.
+        let clickTimer = 0;
+        go.onclick = () => {
+          clearTimeout(clickTimer);
+          clickTimer = window.setTimeout(() => {
+            this.player.seek(m.pos);
+            this.dirty = true;
+          }, 250);
+        };
+        // Rename: swap the button for a text box.
+        const rename = () => {
+          clearTimeout(clickTimer);
+          const input = h('input', { type: 'text', value: m.name, maxLength: 30, class: 'mk-edit', 'aria-label': 'Marker name' } as any);
+          let done = false;
+          const finish = (save: boolean) => {
+            if (done) return;
+            done = true;
+            const name = input.value.trim();
+            if (save && name) m.name = name;
+            this.markersChanged();
+          };
+          input.onkeydown = (e) => {
+            e.stopPropagation();
+            if (e.key === 'Enter') finish(true);
+            if (e.key === 'Escape') finish(false);
+          };
+          input.onblur = () => finish(true);
+          go.replaceWith(input);
+          input.focus();
+          input.select();
+        };
+        go.ondblclick = rename;
+        ren.onclick = rename;
+        loop.onclick = () => {
+          this.loop.a = m.pos;
+          this.loop.b = this.markers[i + 1]?.pos ?? this.length;
+          this.setLoop(true);
+          this.player.seek(this.loop.a);
+        };
+        del.onclick = () => {
+          this.markers.splice(i, 1);
+          this.markersChanged();
+        };
+        return h('span', { class: `marker-chip${i === here ? ' here' : ''}` }, go, ren, loop, del);
+      }),
+    );
+  }
+
+  /** Back to the start of the loop, or of the current section (or the previous one if just past it), and play. */
+  private restart() {
+    if (!this.r) return;
+    const pos = this.player.state.pos;
+    let to = 0;
+    if (this.loop.on) to = this.loop.a;
+    else {
+      const i = this.sectionAt(pos);
+      if (i >= 0) to = pos - this.markers[i].pos < SR && i > 0 ? this.markers[i - 1].pos : this.markers[i].pos;
+    }
+    // Pause first so starting again gives the count-in, if it's on.
+    this.player.pause();
+    this.player.seek(to);
+    void this.player.play();
+    this.dirty = true;
+  }
+
+  /** Skip forward (positive) or back (negative) `sec` seconds, clamped to the song. */
+  private skip(sec: number) {
+    const pos = this.player.state.pos;
+    this.player.seek(sec < 0 ? pos + sec * SR : Math.min(this.length - SR, pos + sec * SR));
+  }
+
+  /** Floor for a track's waveform height: taller while per-track Pan sliders add a row to its control panel. */
+  private laneMinH(): number {
+    return $('lanes').classList.contains('show-pan') ? PAN_MIN_H : LANE_MIN_H;
+  }
+
+  /** Grow (positive) or shrink (negative) every track's waveform by `px`, together. */
+  private resizeLanes(px: number) {
+    for (const l of this.lanes) {
+      const wave = l.el.querySelector('.wave') as HTMLElement;
+      l.height = Math.max(this.laneMinH(), Math.min(500, (l.height ?? wave.clientHeight) + px));
+      wave.style.height = `${l.height}px`;
+    }
+    this.dirty = true;
+    this.emit();
+  }
+
+  private setLoop(on: boolean) {
+    if (on && this.player.recording) return this.notifySeekBlocked();
+    if (on && this.loop.b - this.loop.a < SR / 4) {
+      // No section chosen yet: loop 8 s from the playhead.
+      this.loop.a = this.player.state.pos;
+      this.loop.b = Math.min(this.length, this.loop.a + 8 * SR);
+    }
+    this.loop.on = on;
+    this.player.setLoop(on, this.loop.a, this.loop.b);
+    if (!on && this.pr.trainer.on) {
+      this.pr.trainer.on = false;
+      this.practiceChanged();
+    }
+    this.updateLoopUi();
+    this.emit();
+  }
+
+  /** Resolves true once the playhead reaches `frame`, or false if it hasn't within `timeoutMs`. */
+  private waitForPlayhead(frame: number, timeoutMs: number): Promise<boolean> {
+    return new Promise((resolve) => {
+      const t0 = performance.now();
+      const id = window.setInterval(() => {
+        if (this.player.state.pos >= frame) {
+          clearInterval(id);
+          resolve(true);
+        } else if (performance.now() - t0 > timeoutMs) {
+          clearInterval(id);
+          resolve(false);
+        }
+      }, 10);
+    });
+  }
+
+  /** Which loop edge (if any) sits under x, so grabbing it resizes the section instead of drawing a new one. */
+  private loopEdgeAt(px: number, width: number, view: { start: number; end: number }): 'a' | 'b' | null {
+    if (!(this.loop.b > this.loop.a) || width <= 0) return null;
+    const span = view.end - view.start || 1;
+    const da = Math.abs(px - ((this.loop.a - view.start) / span) * width);
+    const db = Math.abs(px - ((this.loop.b - view.start) / span) * width);
+    if (da > 7 && db > 7) return null;
+    return da <= db ? 'a' : 'b';
+  }
+
+  /** Moves one loop edge, never closer to the other than a quarter second. */
+  private dragLoopEdge(edge: 'a' | 'b', frame: number) {
+    const gap = Math.round(SR / 4);
+    const at = this.snap(frame); // live, so the edge jumps bar to bar under the pointer
+    if (edge === 'a') this.loop.a = Math.round(Math.max(0, Math.min(at, this.loop.b - gap)));
+    else this.loop.b = Math.round(Math.min(this.length, Math.max(at, this.loop.a + gap)));
+    this.dirty = true;
+  }
+
+  private finishLoopEdgeDrag() {
+    this.snapLoop();
+    // While recording, a loop that is on has been suspended; the player is told again when the take ends.
+    if (this.loop.on && !this.player.recording) this.player.setLoop(true, this.loop.a, this.loop.b);
+    this.updateLoopUi();
+    this.emit();
+  }
+
+  /** Removes the A/B section entirely (the Loop button only switches it off and leaves the region). */
+  private clearLoop() {
+    this.loop.a = 0;
+    this.loop.b = 0;
+    this.setLoop(false); // also stops the practice trainer, tells the player, and refreshes the UI
+  }
+
+  private setPoint(which: 'a' | 'b') {
+    this.loop[which] = this.snap(this.player.state.pos);
+    if (this.loop.b <= this.loop.a) {
+      if (which === 'a') this.loop.b = Math.min(this.length, this.loop.a + 8 * SR);
+      else this.loop.a = Math.max(0, this.loop.b - 8 * SR);
+    }
+    this.setLoop(true);
+  }
+
+  private updateLoopUi() {
+    if (!$('keyPanel').hidden) this.refreshKeySectionBtn();
+    pressed($('loopBtn'), this.loop.on);
+    const toStart = this.loop.on && this.loop.b > this.loop.a ? 'Jump to the loop start (Shift: start of the song, loop off)' : 'Jump to the start';
+    $('toStartBtn').title = toStart;
+    $('toStartBtn').setAttribute('aria-label', toStart);
+    $('clearLoop').hidden = !(this.loop.b > this.loop.a);
+    $('loopInfo').textContent =
+      this.loop.b > this.loop.a
+        ? `${fmtTime(this.loop.a / SR)} – ${fmtTime(this.loop.b / SR)}${this.loop.on ? '' : ' (off)'}`
+        : 'Drag to scrub · Shift-drag to pick a section';
+    this.dirty = true;
+  }
+
+  private initOverview() {
+    const wrap = $('overviewWrap');
+    const frac = (e: PointerEvent) => Math.max(0, Math.min(1, (e.clientX - wrap.getBoundingClientRect().left) / wrap.clientWidth));
+    // (fractions are of the visible range; frameAt() converts)
+    wrap.addEventListener('selectstart', (e) => e.preventDefault());
+    wrap.addEventListener('dragstart', (e) => e.preventDefault());
+    wrap.addEventListener('mousedown', noNativeDrag);
+    wrap.addEventListener('pointerdown', (e) => {
+      if ((e.target as HTMLElement).closest('button')) return; // let the zoom overlay's buttons handle their own clicks
+      wrap.setPointerCapture(e.pointerId);
+      // A tab-tap tag: click to select and jump to it, drag to move that tap's time.
+      const box = wrap.getBoundingClientRect();
+      const tag = this.tapTagAt(e.clientX - box.left, e.clientY - box.top);
+      if (tag !== null) {
+        this.selectedTap = tag;
+        this.tapDrag = { charOffset: tag, x0: e.clientX, moved: false };
+        this.updateTabView();
+        return;
+      }
+      const px = frac(e) * wrap.clientWidth;
+      const edge = this.loopEdgeAt(px, wrap.clientWidth, this.view);
+      // A plain drag scrubs (moves the playhead, no section); holding Shift draws a loop section instead.
+      const scrub = !edge && !e.shiftKey;
+      this.drag = { x0: frac(e), moved: false, edge: edge ?? undefined, scrub };
+    });
+    wrap.addEventListener('pointermove', (e) => {
+      if (this.tapDrag) {
+        if (Math.abs(e.clientX - this.tapDrag.x0) > 3) this.tapDrag.moved = true;
+        if (!this.tapDrag.moved) return;
+        const anchors = this.scratch.tabAnchors ?? [];
+        if (isLockedAt(anchors, this.tapDrag.charOffset)) {
+          if (!wrap.dataset.lockedNoted) toast('That tap is locked. Unlock it to move it.');
+          wrap.dataset.lockedNoted = '1'; // once per drag, not per pointer move
+          return;
+        }
+        const frame = Math.max(0, Math.min(this.length, this.snap(this.frameAt(frac(e)))));
+        this.scratch.tabAnchors = moveAnchor(anchors, this.tapDrag.charOffset, frame / SR);
+        this.updateTabView();
+        return;
+      }
+      if (!this.drag) {
+        const px = frac(e) * wrap.clientWidth;
+        const box = wrap.getBoundingClientRect();
+        wrap.style.cursor = this.tapTagAt(e.clientX - box.left, e.clientY - box.top) !== null ? 'grab' : this.loopEdgeAt(px, wrap.clientWidth, this.view) ? 'ew-resize' : '';
+        return;
+      }
+      const f = frac(e);
+      if (this.drag.scrub) {
+        if (Math.abs(f - this.drag.x0) * wrap.clientWidth > 2) this.drag.moved = true;
+        if (this.drag.moved) this.scrubTo(this.frameAt(f));
+        return;
+      }
+      if (this.drag.edge) {
+        if (Math.abs(f - this.drag.x0) * wrap.clientWidth > 3) this.drag.moved = true;
+        if (this.drag.moved) this.dragLoopEdge(this.drag.edge, this.frameAt(f));
+        return;
+      }
+      if (Math.abs(f - this.drag.x0) * wrap.clientWidth > 6) this.drag.moved = true;
+      if (this.drag.moved) {
+        const [a, b] = [this.drag.x0, f].sort((x, y) => x - y);
+        this.dragSection(this.frameAt(a), this.frameAt(b));
+        // Scrub too: the playhead follows the pointer as you drag, with a short preview snippet if paused.
+        this.scrubTo(this.frameAt(f));
+      }
+    });
+    wrap.addEventListener('pointerup', (e) => {
+      if (this.tapDrag) {
+        const { charOffset, moved } = this.tapDrag;
+        this.tapDrag = null;
+        delete wrap.dataset.lockedNoted;
+        if (moved) this.emit();
+        else {
+          const tap = (this.scratch.tabAnchors ?? []).find((a) => a.charOffset === charOffset);
+          if (tap) this.player.seek(tap.time * SR); // a plain click on a tag jumps to that tap
+          this.dirty = true;
+        }
+        return;
+      }
+      if (!this.drag) return;
+      if (this.drag.scrub && this.drag.moved) {
+        // already scrubbed; nothing to commit
+      } else if (this.drag.edge && this.drag.moved) this.finishLoopEdgeDrag();
+      else if (this.drag.moved) {
+        // Mark the section but leave the loop off and playback where scrubbing left it:
+        // dragging is also how you scan the song to find a part, and forcing the loop on
+        // (jumping back to its start) would undo that. Press Loop to actually use the section.
+        this.snapLoop();
+        this.updateLoopUi();
+        this.emit();
+      } else this.seekFrac(frac(e));
+      this.drag = null;
+    });
+  }
+
+  private initKeys() {
+    window.addEventListener('keydown', (e) => {
+      // A focused slider (left there after dragging one, e.g. the zoom scrollbar) doesn't use Space
+      // itself, so let it through to play/pause rather than going dead until you click elsewhere.
+      const onSlider = e.target instanceof HTMLInputElement && e.target.type === 'range' && e.code === 'Space';
+      if (
+        !this.r ||
+        (e.target instanceof HTMLInputElement && !onSlider) ||
+        e.target instanceof HTMLTextAreaElement ||
+        e.target instanceof HTMLSelectElement ||
+        (e.target as HTMLElement)?.isContentEditable
+      )
+        return;
+      // Mixer undo/redo: checked ahead of the modifier-key bail-out below, since every other
+      // shortcut here deliberately ignores Ctrl/Cmd/Alt combinations.
+      if ((e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === 'z') {
+        if (e.shiftKey) this.redo();
+        else this.undo();
+        e.preventDefault();
+        return;
+      }
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      const k = e.key;
+      // Tab+ rhythm editing: a note selected in Follow along (tabStripTrack's own click handler) sets
+      // its length from w/h/q/e/s directly — checked ahead of the rest so it doesn't fight with them
+      // (a bare "e", for instance, isn't bound to anything else here, but being explicit costs nothing).
+      if (this.selectedRhythmNote && /^[whqes]$/.test(k)) this.setSelectedNoteDuration(k);
+      // Same precedence reasoning: Left/Right already means something else below (skip ±5s, or — in
+      // pedal mode — play/restart), but once a note is selected for editing, moving the selection is
+      // the more useful thing for the arrow keys to do. Shift+arrow steps a whole bar at a time.
+      else if (this.selectedRhythmNote && (k === 'ArrowLeft' || k === 'ArrowRight')) this.moveSelectedRhythmNote(k === 'ArrowRight' ? 1 : -1, e.shiftKey);
+      else if (e.code === 'Space' || k === 'PageDown' || k === 'MediaPlayPause' || (this.pedal && ['ArrowRight', 'ArrowDown', 'Enter'].includes(k))) this.toggle();
+      else if (k === 'PageUp' || k === 'Home' || (this.pedal && ['ArrowLeft', 'ArrowUp'].includes(k))) this.restart();
+      else if (k === 'm' || k === 'M') this.addMarker();
+      else if (e.shiftKey && (k === '+' || k === '=')) this.resizeLanes(20);
+      else if (e.shiftKey && (k === '-' || k === '_')) this.resizeLanes(-20);
+      else if (k === '+' || k === '=') this.zoom(2);
+      else if (k === '-' || k === '_') this.zoom(0.5);
+      else if (k === '0') this.zoomFit();
+      else if (e.key === 'ArrowLeft') this.skip(-5);
+      else if (e.key === 'ArrowRight') this.skip(5);
+      else if ((k === 'Delete' || k === 'Backspace') && this.selectedTap !== null) this.removeSelectedTap();
+      else if (e.key === 'l' || e.key === 'L') this.setLoop(!this.loop.on);
+      else if (e.key === 'f' || e.key === 'F') this.tx.toggleFreeze();
+      else if (e.key === '[') this.setPoint('a');
+      else if (e.key === ']') this.setPoint('b');
+      else if (/^[1-6]$/.test(e.key) && this.lanes[+e.key - 1]) this.setLaneRecorded(this.lanes[+e.key - 1], { mute: !this.lanes[+e.key - 1].mute });
+      else return;
+      e.preventDefault();
+    });
+  }
+
+  // ---------- drawing ----------
+  private invalidateLayers() {
+    this.overviewLayers = null;
+    for (const l of this.lanes) l.layers = undefined;
+    this.dirty = true;
+  }
+
+  private drawStrip(canvas: HTMLCanvasElement, layers: [HTMLCanvasElement, HTMLCanvasElement], pos: number, showLoop: boolean, view = this.view) {
+    const g = fitCanvas(canvas);
+    const { width: w, height: hh } = canvas;
+    g.clearRect(0, 0, w, hh);
+    const x = (f: number) => ((f - view.start) / (view.end - view.start)) * w;
+    const px = Math.max(-2, Math.min(w + 2, x(pos)));
+    if (showLoop && this.loop.b > this.loop.a) {
+      const xa = x(this.loop.a);
+      const xb = x(this.loop.b);
+      g.save();
+      g.fillStyle = getComputedStyle(document.body).getPropertyValue('--loop').trim() || '#22d3ee';
+      g.globalAlpha = this.loop.on ? 0.3 : 0.2;
+      g.fillRect(xa, 0, xb - xa, hh);
+      // Edge lines mark exactly where A and B are, so a marked-but-off section is still obvious.
+      const edge = Math.max(2, Math.round(devicePixelRatio * 2));
+      g.globalAlpha = this.loop.on ? 1 : 0.75;
+      g.fillRect(Math.round(xa), 0, edge, hh);
+      g.fillRect(Math.round(xb) - edge, 0, edge, hh);
+      g.restore();
+    }
+    g.drawImage(layers[0], 0, 0);
+    g.save();
+    g.beginPath();
+    g.rect(0, 0, px, hh);
+    g.clip();
+    g.drawImage(layers[1], 0, 0);
+    g.restore();
+    // Section markers
+    g.fillStyle = '#f59e0b';
+    for (const m of this.markers) {
+      const mx = x(m.pos);
+      if (mx < -1 || mx > w + 1) continue;
+      g.fillRect(Math.round(mx), 0, Math.max(1, devicePixelRatio), hh);
+    }
+    // Tab taps (tab+): a short green tick up from the bottom edge, so where the tab is pinned to the
+    // recording shows on every waveform.
+    const taps = this.scratch.tabAnchors;
+    if (taps?.length) {
+      g.fillStyle = TAB_TAP_COLOUR;
+      for (const a of taps) {
+        const tx = x(a.time * SR);
+        if (tx < -1 || tx > w + 1) continue;
+        g.fillRect(Math.round(tx), Math.round(hh * 0.62), Math.max(2, devicePixelRatio * 1.5), Math.ceil(hh * 0.38));
+      }
+    }
+    g.fillStyle = getComputedStyle(document.body).color;
+    g.fillRect(Math.round(px), 0, Math.max(1, devicePixelRatio), hh);
+  }
+
+  /** Sets the selected note's (see tabStripTrack's click handler) rhythm length from a single key
+   * press (w/h/q/e/s) — writes the letter into the rhythm line under it (inserting one for its block
+   * first if it doesn't have one yet), the same text parseScore already reads everything else from.
+   * See setRhythmLetter (tabSync.ts) for the actual text edit; this is just locating the right note
+   * and block for it, and the surrounding bookkeeping (shifting tap anchors past the edit, the same
+   * way "Add rhythm line" already does for its own insertions, and re-rendering). */
+  private setSelectedNoteDuration(letter: string) {
+    const sel = this.selectedRhythmNote;
+    if (!sel) return;
+    const text = this.scratchAreas.tab.value;
+    const note = findNoteAt(this.parseActive(text).notes, sel.bar, sel.col);
+    if (!note) {
+      this.selectedRhythmNote = null; // the tab changed under us; nothing there to edit any more
+      return;
+    }
+    const block = tabBlocks(text)[note.block];
+    const { text: newText, insertAt, grew } = setRhythmLetter(text, block, sel.col, letter);
+    this.scratchAreas.tab.value = newText;
+    this.scratch.tab = newText;
+    this.scratch.tabAnchors = (this.scratch.tabAnchors ?? []).map((a) => (a.charOffset >= insertAt ? { ...a, charOffset: a.charOffset + grew } : a));
+    void this.renderTabStrip();
+    this.updateTabStrip();
+    this.updateScratchSummary();
+    this.emit();
+  }
+
+  /** Arrow-key navigation between notes in Follow along: plain Left/Right to the previous/next note in
+   * playing order (noteCols — one entry per chord, not per string); Shift+Left/Right a whole bar at a
+   * time, to the first note of the previous/next bar that actually has one (an empty bar is skipped
+   * over, not landed on). Just moves the selection — no text edit, so no anchor-shifting or re-render
+   * of the tab itself, only the highlight box's position. */
+  private moveSelectedRhythmNote(dir: 1 | -1, byBar: boolean) {
+    const sel = this.selectedRhythmNote;
+    if (!sel) return;
+    const cols = noteCols(this.parseActive(this.scratchAreas.tab.value).notes);
+    let target: { bar: number; col: number } | undefined;
+    if (byBar) {
+      const bars = [...new Set(cols.map((c) => c.bar))].sort((a, b) => a - b);
+      const bi = bars.indexOf(sel.bar);
+      const targetBar = bi === -1 ? undefined : bars[bi + dir];
+      target = targetBar === undefined ? undefined : cols.find((c) => c.bar === targetBar); // cols is start-sorted, so this is that bar's first note
+    } else {
+      const idx = cols.findIndex((c) => c.bar === sel.bar && c.col === sel.col);
+      target = idx === -1 ? undefined : cols[idx + dir];
+    }
+    if (!target) return;
+    this.selectedRhythmNote = { bar: target.bar, col: target.col };
+    this.updateTabStrip();
+    this.scrollSelectedRhythmNoteIntoView();
+  }
+
+  /** A click can only ever select something already on screen, but keyboard navigation
+   * (moveSelectedRhythmNote, above) can land on a note or bar well past either edge of the current
+   * view — scrolls (see viewCoord) just enough to bring it back into view when that happens, holding
+   * it at the same 40%-from-left position the playback cursor sits at. Left alone (most presses — the
+   * usual case of moving a note or two) when the note's already comfortably visible, so this doesn't
+   * re-centre the view on every single press. Like any manual scroll it's dropped as soon as playback
+   * itself moves. */
+  private scrollSelectedRhythmNoteIntoView() {
+    const layout = this.stripLayout;
+    const sel = this.selectedRhythmNote;
+    if (!layout || !sel) return;
+    const note = layout.notes.find((n) => n.bar === sel.bar && n.col === sel.col);
+    const coord = this.coordAt(this.smoothStripPos() / SR);
+    if (!note || coord === null) return;
+    const margin = 24;
+    const left = note.x + this.lastStripPx;
+    if (left >= margin && left + note.w <= $('tabStripView').clientWidth - margin) return; // already comfortably visible
+    this.tabPan = note.u - coord;
+    this.tabPanAt = coord;
+    this.updateTabStrip();
+    this.updateTabStaff();
+  }
+
+  /** Click-and-drag on blank space in Follow along (or the Staff under it) scrolls the tab sideways to
+   * look ahead or back without moving playback. A drag that starts on a note is left alone (that's a
+   * click to select it), and one that did move suppresses the click that follows it, so letting go
+   * doesn't deselect. Only while stopped: while playing, the view follows the music every frame anyway. */
+  private initTabPan(viewId: string, layoutOf: () => { map: { u: number; x: number }[] } | null) {
+    const view = $(viewId);
+    view.addEventListener('pointerdown', (e) => {
+      this.tabPanMoved = false;
+      if (e.button !== 0 || this.player.state.playing || (e.target as HTMLElement).closest('[data-col]')) return;
+      const layout = layoutOf();
+      const coord = this.coordAt(this.smoothStripPos() / SR);
+      if (!layout || coord === null) return;
+      const startX = e.clientX;
+      const startViewX = staffX(layout.map, this.viewCoord(coord));
+      // Captured only once it's really a drag (below), so a plain click on blank space still reaches
+      // tabStripTrack's own click handler unchanged rather than being retargeted to the view.
+      view.classList.add('panning'); // the grabbing hand shows while the button is down, the arrow otherwise
+      const move = (m: PointerEvent) => {
+        const dx = m.clientX - startX;
+        if (!this.tabPanMoved && Math.abs(dx) < 4) return;
+        if (!this.tabPanMoved) view.setPointerCapture(e.pointerId);
+        this.tabPanMoved = true;
+        this.tabPan = staffU(layout.map, startViewX - dx) - coord;
+        this.tabPanAt = coord;
+        this.updateTabStrip();
+        this.updateTabStaff();
+      };
+      const up = () => {
+        view.classList.remove('panning');
+        view.removeEventListener('pointermove', move);
+        window.removeEventListener('pointerup', up);
+        window.removeEventListener('pointercancel', up);
+      };
+      view.addEventListener('pointermove', move);
+      // On window, not the view: released outside it before a drag has started (and so been captured),
+      // the view would never hear about it and the hand would stay stuck on.
+      window.addEventListener('pointerup', up);
+      window.addEventListener('pointercancel', up);
+    });
+  }
+
+  /** Loops the song over bars `first`..`last` (0-based, inclusive) of the tab — turning the tab's own
+   * position back into song time through the taps (and the song's tempo, with a single tap), so a hard
+   * bar is one click away from a loop, and from the speed trainer. Needs the tab timed, like Follow
+   * along itself does. A repeat's section is looped as written (its first pass). */
+  private loopBars(first: number, last: number) {
+    const bars = this.stripBars;
+    const a = bars[first];
+    const b = bars[last];
+    if (!a || !b) return;
+    const tl = this.timeline();
+    const bpm = this.r?.analysis?.bpm;
+    const uu = (u: number) => (tl.plan ? toUnrolled(tl.plan, u) : u);
+    const t0 = timeAtCoord(tl.coordsU, bpm, uu(a.start));
+    const t1 = timeAtCoord(tl.coordsU, bpm, uu(b.start) + b.length);
+    if (t0 === null || t1 === null) {
+      toast('Tap the tab to time it first, then bar numbers can set the loop');
+      return;
+    }
+    const lo = Math.max(0, Math.min(this.length, Math.round(t0 * SR)));
+    const hi = Math.max(0, Math.min(this.length, Math.round(t1 * SR)));
+    if (hi - lo < SR / 4) {
+      toast("That bar is past the end of the song (or its timing isn't set that far)");
+      return;
+    }
+    this.loop.a = lo;
+    this.loop.b = hi;
+    this.setLoop(true);
+    this.player.seek(lo);
+    toast(first === last ? `Looping bar ${first + 1}` : `Looping bars ${first + 1}–${last + 1}`);
+  }
+
+  private removeSelectedTap() {
+    if (this.selectedTap === null) return;
+    const anchors = this.scratch.tabAnchors ?? [];
+    if (isLockedAt(anchors, this.selectedTap)) {
+      toast('That tap is locked. Unlock it first.');
+      return;
+    }
+    this.scratch.tabAnchors = removeAnchor(anchors, this.selectedTap);
+    this.selectedTap = null;
+    this.updateTabView();
+    this.emit();
+  }
+
+  /** The tap whose overview tag is under (x, y), in CSS px relative to the overview. */
+  private tapTagAt(x: number, y: number): number | null {
+    for (const t of this.tapTagRects) if (x >= t.x0 && x <= t.x1 && y >= t.y0 && y <= t.y1) return t.charOffset;
+    return null;
+  }
+
+  /** Numbered tags for the tab taps along the top of the overview. The number is the tap's place
+   * in the tab (1 = earliest in the text), not in time, so a tap made on a later loop pass still
+   * reads as the part of the tab it belongs to. */
+  private drawTabTapLabels(c: HTMLCanvasElement) {
+    this.tapTagRects = [];
+    const taps = this.scratch.tabAnchors;
+    if (!taps?.length) return;
+    const g = c.getContext('2d')!;
+    const w = c.width;
+    const dpr = devicePixelRatio || 1;
+    g.font = `600 ${10 * dpr}px system-ui, sans-serif`;
+    g.textBaseline = 'top';
+    const span = this.view.end - this.view.start;
+    const sx = c.clientWidth / (c.width || 1);
+    const sy = c.clientHeight / (c.height || 1);
+    const y = this.markers.length ? 15 * dpr : 0; // just under any section-marker names, clear of the zoom buttons at the bottom right
+    const h = 13 * dpr;
+    taps.forEach((a, i) => {
+      const tx = ((a.time * SR - this.view.start) / span) * w;
+      if (tx < -40 * dpr || tx > w) return;
+      const label = `T${i + 1}`;
+      const lockW = a.locked ? 8 * dpr : 0;
+      const tw = g.measureText(label).width + 6 * dpr + lockW;
+      g.fillStyle = TAB_TAP_COLOUR;
+      g.fillRect(tx, y, tw, h);
+      g.fillStyle = '#111';
+      g.fillText(label, tx + 3 * dpr, y + 1.5 * dpr);
+      if (a.locked) {
+        // A small padlock (body + shackle) drawn from shapes, so it doesn't depend on an emoji font.
+        const lx = tx + tw - 8 * dpr;
+        g.fillRect(lx, y + 6 * dpr, 5 * dpr, 4.5 * dpr);
+        g.strokeStyle = '#111';
+        g.lineWidth = Math.max(1, dpr);
+        g.beginPath();
+        g.arc(lx + 2.5 * dpr, y + 6 * dpr, 1.9 * dpr, Math.PI, 0);
+        g.stroke();
+      }
+      if (a.charOffset === this.selectedTap) {
+        g.strokeStyle = getComputedStyle(document.body).color;
+        g.lineWidth = Math.max(1, dpr);
+        g.strokeRect(tx + 0.5, y + 0.5, tw - 1, h - 1);
+      }
+      this.tapTagRects.push({ charOffset: a.charOffset, x0: tx * sx, x1: (tx + tw) * sx, y0: y * sy, y1: (y + h) * sy });
+    });
+  }
+
+  /** Marker names on the overview. */
+  private drawMarkerLabels(c: HTMLCanvasElement) {
+    if (!this.markers.length) return;
+    const g = c.getContext('2d')!;
+    const w = c.width;
+    const dpr = devicePixelRatio || 1;
+    g.font = `600 ${10 * dpr}px system-ui, sans-serif`;
+    g.textBaseline = 'top';
+    for (const m of this.markers) {
+      const mx = ((m.pos - this.view.start) / (this.view.end - this.view.start)) * w;
+      if (mx < -40 * dpr || mx > w) continue;
+      const tw = g.measureText(m.name).width + 6 * dpr;
+      g.fillStyle = '#f59e0b';
+      g.fillRect(mx, 0, tw, 13 * dpr);
+      g.fillStyle = '#111';
+      g.fillText(m.name, mx + 3 * dpr, 1.5 * dpr);
+    }
+  }
+
+  private draw() {
+    this.dirty = false;
+    const pos = this.player.state.pos;
+    $('timeNow').textContent = fmtTime(pos / SR);
+    this.updateLyricsFollow(pos);
+    this.updateTabStrip();
+    this.updateTabStaff();
+    // Keep the playhead in view while zoomed in.
+    const span = this.view.end - this.view.start;
+    if (this.player.state.playing && span < this.length - 1 && (pos > this.view.end || pos < this.view.start)) this.setView(pos - span * 0.1, pos + span * 0.9);
+    const here = this.sectionAt(pos);
+    if (here !== (this as any).lastHere) {
+      (this as any).lastHere = here;
+      this.renderMarkers();
+    }
+    const ov = $<HTMLCanvasElement>('overview');
+    fitCanvas(ov);
+    const buckets = (w: number) => Math.max(1, Math.round(w / Math.max(2, Math.round(w / 700) + 1)));
+    if (!this.overviewLayers || this.overviewLayers[0].width !== ov.width || this.overviewLayers[0].height !== ov.height) {
+      const all = this.r!.stems.flatMap((s) => s.data);
+      const p = peaksForView(this.overviewPeaks, all, this.view.start, this.view.end, buckets(ov.width));
+      this.overviewLayers = [
+        waveLayer(p, ov.width, ov.height, 'rgba(139,147,165,0.55)', this.overviewScale),
+        waveLayer(p, ov.width, ov.height, '#8b7cf6', this.overviewScale),
+      ];
+    }
+    this.drawStrip(ov, this.overviewLayers, pos, true);
+    this.drawBars(ov);
+    this.drawMarkerLabels(ov);
+    this.drawTabTapLabels(ov);
+    for (const l of this.lanes) {
+      fitCanvas(l.canvas);
+      const view = l.ownView ?? this.view;
+      if (!l.layers || l.layers[0].width !== l.canvas.width || l.layers[0].height !== l.canvas.height) {
+        const c = l.colour;
+        const p = peaksForView(l.peaks, l.data, view.start, view.end, buckets(l.canvas.width));
+        l.layers = [waveLayer(p, l.canvas.width, l.canvas.height, c + '66', this.laneScale), waveLayer(p, l.canvas.width, l.canvas.height, c, this.laneScale)];
+      }
+      this.drawStrip(l.canvas, l.layers, pos, true, view);
+      this.drawBars(l.canvas, view, true);
+    }
+    this.tx.draw(pos);
+  }
+
+  /** Bar lines (and, zoomed in, every beat) once the tempo is known: faint on the overview, clearer on the tracks, where they mark where the click sounds so a take can be lined up against it. */
+  private drawBars(c: HTMLCanvasElement, view = this.view, lane = false) {
+    const beats = this.beatFrames();
+    if (!beats.length) return;
+    const g = c.getContext('2d')!;
+    const w = c.width;
+    const span = view.end - view.start || 1;
+    const x = (f: number) => Math.round(((f - view.start) / span) * w);
+    const d = this.downbeat();
+    const bars = beats.filter((_, i) => (i - d) % this.pr.perBar === 0);
+    g.fillStyle = lane ? '#2dd4bf' : getComputedStyle(document.body).color;
+    const thick = Math.max(1, devicePixelRatio);
+    // Zoomed in far enough: show every beat, bars stronger.
+    if (beats.length > 1 && ((beats[1] - beats[0]) / span) * w >= 8) {
+      g.globalAlpha = lane ? 0.55 : 0.08;
+      for (const b of beats) if (b >= view.start && b <= view.end) g.fillRect(x(b), 0, thick, c.height);
+    }
+    if (bars.length > 1 && ((bars[1] - bars[0]) / span) * w >= 4) {
+      g.globalAlpha = lane ? 0.8 : 0.2;
+      for (const b of bars) if (b >= view.start && b <= view.end) g.fillRect(x(b), 0, thick, c.height);
+    }
+    g.globalAlpha = 1;
+  }
+
+  // ---------- export ----------
+  private baseName() {
+    return safeName((this.r?.title ?? 'track').replace(/\.[a-z0-9]{2,5}$/i, ''));
+  }
+
+  private async saveStem(i: number) {
+    if (!this.r) return;
+    const lane = this.lanes[i];
+    const o = this.settings();
+    const t = toast(`Encoding ${laneLabel(lane)}…`);
+    try {
+      await this.encoder.run({ type: 'stems', stems: [{ name: safeName(laneLabel(lane)), data: lane.data }], out: o }, async (name, bytes) => {
+        await saveFile(`${this.baseName()} - ${name}.${extensionFor(o)}`, bytes, mimeFor(o));
+      });
+    } catch (e) {
+      toast(`Export failed: ${(e as Error).message}`, true);
+    } finally {
+      t.remove();
+    }
+  }
+
+  private async saveAll() {
+    if (!this.r) return;
+    const o = this.settings();
+    const base = this.baseName();
+    const sink = await openSink(`${base} (stems).zip`);
+    if (!sink) return;
+    const btn = $<HTMLButtonElement>('saveAllBtn');
+    btn.disabled = true;
+    let n = 0;
+    const total = this.r.stems.length;
+    btn.textContent = `Encoding 0/${total}…`;
+    // Track names become file names, so keep them unique even if two tracks share a rename.
+    const seen = new Map<string, number>();
+    const stems = this.lanes.map((l) => {
+      let name = safeName(laneLabel(l));
+      const n = (seen.get(name.toLowerCase()) ?? 0) + 1;
+      seen.set(name.toLowerCase(), n);
+      if (n > 1) name = `${name} (${n})`;
+      return { name, data: l.data };
+    });
+    try {
+      await this.encoder.run({ type: 'stems', stems, out: o }, async (name, bytes) => {
+        await sink.write(`${base} - ${name}.${extensionFor(o)}`, bytes);
+        btn.textContent = `Encoding ${++n}/${total}…`;
+      });
+      await sink.close();
+      toast(`Saved ${total} stems`);
+    } catch (e) {
+      toast(`Export failed: ${(e as Error).message}`, true);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Save all stems';
+    }
+  }
+
+  private async exportMix() {
+    if (!this.r) return;
+    const o = this.settings();
+    const useLoop = this.loop.on && this.loop.b > this.loop.a;
+    const [start, end] = useLoop ? [this.loop.a, this.loop.b] : [0, this.length];
+    const g = this.gains();
+    const on = this.lanes.filter((_, i) => g[i] > 0).map((l) => l.name);
+    const bits = [
+      on.length === this.lanes.length ? 'mix' : on.join('+') || 'silence',
+      this.tempo !== 1 ? `${Math.round(this.tempo * 100)}%` : '',
+      this.pitch ? `${this.pitch > 0 ? '+' : ''}${this.pitch}st` : '',
+      this.lanes.some((l, i) => g[i] > 0 && !isFlat(l.eq)) ? 'EQ' : '',
+      useLoop ? `${fmtTime(start / SR).replace(':', '.')}-${fmtTime(end / SR).replace(':', '.')}` : '',
+    ].filter(Boolean);
+    const name = `${this.baseName()} - ${bits.join(' ')}.${extensionFor(o)}`;
+    const btn = $<HTMLButtonElement>('exportMixBtn');
+    btn.disabled = true;
+    btn.textContent = 'Rendering…';
+    try {
+      await this.encoder.run(
+        { type: 'mix', name, stems: this.r.stems.map((s) => s.data), gains: g, pans: this.pans(), eqs: this.eqs(), start, end, tempo: this.tempo, pitch: this.pitch, out: o },
+        async (n, bytes) => void (await saveFile(n, bytes, mimeFor(o))),
+      );
+    } catch (e) {
+      toast(`Export failed: ${(e as Error).message}`, true);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Export mix';
+    }
+  }
+}

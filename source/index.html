@@ -1,0 +1,779 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta name="referrer" content="no-referrer" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; media-src 'self' blob:; connect-src 'self' https://huggingface.co https://*.hf.co; object-src 'none'; base-uri 'self'; form-action 'none'" />
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Guitar Practice PWA — Steminize</title>
+    <meta name="description" content="A practice studio for musicians. Split songs into stems, loop and slow them down, and learn them with chords and tab. Runs entirely on your device." />
+    <meta name="theme-color" content="#09090d" id="themeColorMeta" />
+    <script>
+      // Pick the theme before anything is drawn, so the page never flashes the wrong one (the full logic is in src/theme.ts).
+      (function () {
+        var t = 'dark';
+        try {
+          if (localStorage.getItem('steminize.theme') === 'light') t = 'light';
+        } catch (e) {}
+        document.documentElement.setAttribute('data-theme', t);
+      })();
+    </script>
+    <link rel="icon" href="./icon.svg" type="image/svg+xml" />
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="./icon-192.png" />
+  </head>
+  <body>
+    <header class="top">
+      <div class="brand">
+        <img src="./icon.svg" alt="" width="28" height="28" />
+        <span>Guitar Practice <small>by Steminize</small></span>
+        <small class="ver" id="appVersion"></small>
+      </div>
+      <div class="chips">
+        <span class="chip" id="backendChip" title="Where separation runs">Checking device…</span>
+        <button class="chip-info" id="gpuLinuxNote" type="button" hidden title="GPU use on Linux: known risk — click for details" aria-label="GPU use on Linux: known risk — click for details">ⓘ</button>
+        <span class="chip ok" id="privacyChip" title="Audio never leaves this device">端末内処理</span>
+      </div>
+      <div class="top-actions">
+        <button class="btn ghost" id="installBtn" hidden>Install app</button>
+        <button class="btn ghost icon" id="themeBtn" type="button" title="Switch to light theme">
+          <svg class="i-moon" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M20.354 15.354A9 9 0 0 1 8.646 3.646 9.003 9.003 0 1 0 20.354 15.354Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <svg class="i-sun" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><circle cx="12" cy="12" r="4" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+        </button>
+        <button class="btn ghost" id="modelsBtn">AIモデル</button>
+        <button class="btn ghost icon" id="aboutBtn" type="button" title="About Steminize" aria-label="About Steminize">
+          <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M12 11v5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="12" cy="7.9" r="1.1" fill="currentColor"/></svg>
+        </button>
+        <button class="btn ghost icon" id="helpBtn" type="button" title="Keyboard shortcuts">
+          <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M9.5 9.2a2.5 2.5 0 1 1 3.7 2.2c-.9.5-1.2 1-1.2 1.9" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" fill="none"/><circle cx="12" cy="17" r="1" fill="currentColor" stroke="none"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <main class="layout">
+      <aside class="side">
+        <nav class="side-tabs" role="tablist">
+          <button class="stab" type="button" role="tab" data-side="songs" aria-selected="true">ライブラリ</button>
+          <button class="stab" type="button" role="tab" data-side="settings" aria-selected="false">分離設定</button>
+        </nav>
+        <div class="side-pane" data-sidepane="songs">
+        <label class="drop" id="drop">
+          <input type="file" id="fileInput" accept="audio/*,.mp3,.wav,.flac,.ogg,.m4a,.aac,.opus,.aiff,.aif" multiple hidden />
+          <svg viewBox="0 0 24 24" width="28" height="28" aria-hidden="true"><path d="M12 3v12m0-12 4 4m-4-4-4 4M4 15v3a3 3 0 0 0 3 3h10a3 3 0 0 0 3-3v-3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <strong>曲をここにドロップ</strong>
+          <span>タップして選択 · MP3 / WAV / FLAC / M4A / OGG</span>
+        </label>
+        <div class="multi">
+          <span class="muted small">分離済みの音源を使う</span>
+          <label class="btn tiny ghost" title="Open several audio files as one song, one lane each (no separation)">パートを開く<input type="file" id="multiFiles" accept="audio/*,.mp3,.wav,.flac,.ogg,.m4a,.aac,.opus,.aiff,.aif" multiple hidden /></label>
+          <label class="btn tiny ghost" id="multiFolderLabel" title="Open every audio file in a folder as one song">フォルダを開く<input type="file" id="multiFolder" webkitdirectory multiple hidden /></label>
+          <button class="btn tiny ghost" type="button" id="ytBtn" title="Search YouTube and download a track to separate" hidden>From YouTube…</button>
+        </div>
+        <p class="use-sum muted small">分離設定： <b id="useSum"></b> · <button class="linkish" type="button" id="changeSettings">変更</button></p>
+
+        <section class="card" id="queueCard" hidden>
+          <div class="card-head">
+            <h2>Queue</h2>
+            <div class="q-actions">
+              <label class="switch" title="Start separating as soon as songs are added"><input type="checkbox" id="autoStart" /> Auto-start</label>
+              <button class="btn tiny ghost" id="clearDone" hidden>Clear finished</button>
+            </div>
+          </div>
+          <div class="q-bar">
+            <button class="btn tiny primary" id="queueBtn" hidden></button>
+            <button class="btn tiny ghost" id="applyWaiting" hidden title="Songs keep the settings they were added with">Use current settings for waiting songs</button>
+          </div>
+          <ul class="queue" id="queue"></ul>
+          <p class="muted empty" id="queueEmpty">Nothing queued yet.</p>
+        </section>
+
+        <section class="card" id="libraryCard">
+          <div class="card-head">
+            <h2>ライブラリ</h2>
+            <label class="switch" title="Keep separated songs on this computer so they reopen instantly"><input type="checkbox" id="autoSave" /> 曲を保存</label>
+          </div>
+          <ul class="queue lib" id="libList"></ul>
+          <p class="muted small empty" id="libInfo">Separated songs are kept here so you don't have to wait again.</p>
+          <p class="muted small backup-note" id="libBackupNote" hidden></p>
+          <div class="q-bar" id="libBackupBar" hidden>
+            <button class="btn tiny ghost" id="libExport" title="Save every song in the library, with its settings, as one zip file">バックアップ</button>
+            <label class="btn tiny ghost" title="Add songs from a backup zip. Songs already in the library are left alone.">復元<input type="file" id="libImport" accept=".zip,application/zip" hidden /></label>
+          </div>
+        </section>
+        <section class="card" id="setlistCard">
+          <div class="card-head">
+            <h2>セットリスト</h2>
+            <span id="slSelect" hidden></span>
+          </div>
+          <div class="sl-bar">
+            <button class="btn tiny ghost" id="slNew" type="button" title="Start a new setlist">New</button>
+            <button class="btn tiny ghost" id="slRename" type="button" hidden>Rename</button>
+            <button class="btn tiny ghost" id="slDelete" type="button" hidden title="Delete this setlist (the songs stay in your library)">Delete</button>
+          </div>
+          <ol class="queue lib sl-list" id="slList" hidden></ol>
+          <p class="muted small empty" id="slInfo"></p>
+          <div class="sl-add" id="slAddRow" hidden><span id="slAdd"></span></div>
+          <div class="sl-transport" id="slTransport" hidden>
+            <div class="sl-buttons">
+              <button class="btn tiny ghost" id="slPrev" type="button" title="Previous song">◀ Prev</button>
+              <button class="btn tiny primary" id="slPlay" type="button" title="Start from the first song">▶ Play setlist</button>
+              <button class="btn tiny ghost" id="slNext" type="button" title="Next song">Next ▶</button>
+            </div>
+            <div class="sl-auto">
+              <label class="switch" title="Start the next song by itself when one ends"><input type="checkbox" id="slAuto" /> Auto-advance</label>
+              <span id="slGap"></span>
+            </div>
+          </div>
+        </section>
+        </div>
+        <div class="side-pane" data-sidepane="settings" hidden>
+        <section class="card settings" id="settings">
+          <div class="card-head">
+            <h2>Separation</h2>
+            <button class="btn tiny ghost" id="resetSettings" title="Restore defaults">Reset</button>
+          </div>
+
+          <div class="field">
+            <span class="label">Model</span>
+            <div class="model-cards" id="modelCards"></div>
+          </div>
+
+          <div class="field">
+            <span class="label">Stems</span>
+            <select id="twoStems"></select>
+            <div class="stem-toggles" id="stemToggles" title="Stems to keep"></div>
+          </div>
+
+          <details class="more">
+            <summary>Quality &amp; device</summary>
+            <div class="field">
+              <span class="label">Shifts <output id="shiftsOut"></output></span>
+              <input type="range" id="shifts" min="1" max="10" step="1" />
+              <small class="muted">Averages several slightly offset passes. Each extra shift adds a full pass: 2 = twice as slow, a small gain.</small>
+            </div>
+            <div class="field">
+              <span class="label">Overlap <output id="overlapOut"></output></span>
+              <input type="range" id="overlap" min="0.1" max="0.5" step="0.05" />
+              <small class="muted">Blend between 7.8 s segments. 25% is Demucs' default; 10% is a little faster.</small>
+            </div>
+            <div class="field row">
+              <label>Download size
+                <select id="precision">
+                  <option value="compact">Compact (fp16)</option>
+                  <option value="full">Full (fp32)</option>
+                </select>
+              </label>
+              <label>Run on
+                <select id="device">
+                  <option value="auto">Auto</option>
+                  <option value="gpu">GPU (WebGPU)</option>
+                  <option value="cpu">CPU</option>
+                </select>
+              </label>
+            </div>
+          </details>
+
+          <details class="more">
+            <summary>Output format</summary>
+            <div class="field">
+              <div class="seg" id="format">
+                <button data-v="wav">WAV</button><button data-v="flac">FLAC</button><button data-v="mp3">MP3</button>
+              </div>
+            </div>
+            <div class="field row">
+              <label id="wavDepthWrap">Bit depth
+                <select id="wavDepth"><option value="16">16-bit</option><option value="24">24-bit</option><option value="32f">32-bit float</option></select>
+              </label>
+              <label id="flacDepthWrap">Bit depth
+                <select id="flacDepth"><option value="16">16-bit</option><option value="24">24-bit</option></select>
+              </label>
+              <label id="mp3Wrap">Bitrate
+                <select id="mp3Bitrate"><option>128</option><option>192</option><option>256</option><option>320</option></select>
+              </label>
+              <label>Clipping
+                <select id="clip">
+                  <option value="rescale">Rescale</option>
+                  <option value="clamp">Clamp</option>
+                  <option value="none">None</option>
+                </select>
+              </label>
+            </div>
+          </details>
+          <p class="estimate" id="estimate"></p>
+        </section>
+        <section class="card settings" id="youtubeCard" hidden>
+          <div class="card-head">
+            <h2>From YouTube</h2>
+          </div>
+          <label class="switch" title="Shows the From YouTube… button next to Open multitrack"><input type="checkbox" id="youtubeOpt" /> Show the From YouTube… button</label>
+          <p class="muted small" id="youtubeNotice"></p>
+        </section>
+        <section class="card settings" id="nativeInfoCard" hidden>
+          <div class="card-head">
+            <h2>Native audio</h2>
+            <button class="btn tiny ghost" id="nativeInfoShow" type="button" title="Open a song's Live input drawer at the Native audio row">Show me where</button>
+          </div>
+          <p class="muted small" id="nativeInfoText"></p>
+        </section>
+        <section class="card settings" id="appPrefs">
+          <div class="card-head">
+            <h2>App preferences</h2>
+            <button class="btn tiny ghost" id="resetAppPrefs" title="Put the theme, panels and live-input and native-audio choices back to how they start">Reset</button>
+          </div>
+          <p class="muted small">The theme, which panels are open, the live-input and native-audio choices and other interface choices. Resetting puts them back to how they start. Your library, setlists and the separation settings above are not touched.</p>
+        </section>
+        </div>
+      </aside>
+
+      <section class="stage">
+        <div class="welcome" id="welcome">
+          <h1>曲を選んで、弾こう。</h1>
+          <p class="lead">ギターを消す。ゆっくり弾く。繰り返す。</p>
+          <div class="start-row">
+            <button class="btn primary" id="welcomeChoose" type="button" title="Pick a song from this computer to split into stems">曲を取り込む</button>
+            <button class="btn ghost" id="welcomeSample" type="button" hidden>Try a sample song</button>
+            <button class="btn ghost" id="welcomeTracks" type="button" title="Open separate audio files (one per instrument) as one song, with no splitting">分離済みの音源を開く</button>
+          </div>
+          <details class="gp-welcome-info"><summary>初めて使うとき</summary>
+          <p class="muted small" id="welcomeNative" hidden></p>
+
+          <p id="welcomeModel" class="welcome-model"></p>
+          <p class="muted small">初回はAIモデルのダウンロードが必要です。iPadの6ステム分離は実機検証前のため、まず短い曲でお試しください。処理中は画面を開いたままにしてください。</p>
+          <h2 class="welcome-sub">練習の進め方</h2>
+          <ul class="can-do">
+            <li><b>A–Bループと速度変更</b>でフレーズを集中練習</li>
+            <li><b>ギターなし／ドラム＋ベースのみ</b>をワンタップで選択</li>
+            <li><b>原曲の検出した拍</b>に合わせてクリック再生</li>
+            <li><b>詳細モード</b>で従来の録音・コード・TAB機能も利用</li>
+          </ul>
+          </details>
+        </div>
+
+        <div class="deck" id="deck" hidden>
+          <div class="deck-top">
+            <div class="deck-head">
+              <div>
+                <h1 id="trackTitle"></h1>
+                <p class="muted" id="trackMeta"></p>
+              </div>
+              <div class="deck-actions">
+                <button class="btn ghost" id="rerunBtn" title="Separate again with the current settings">Re-run</button>
+                <button class="btn ghost" id="exportMixBtn" title="Save what you hear: mutes, levels, tempo and pitch">Export mix</button>
+                <button class="btn primary" id="saveAllBtn">Save all stems</button>
+              </div>
+            </div>
+
+            <div class="transport">
+              <div class="ov-col">
+                <div class="overview" id="overviewWrap">
+                  <canvas id="overview"></canvas>
+                  <div class="zoom">
+                    <button class="btn tiny ghost" id="zoomOut" title="Zoom out (−)">−</button>
+                    <button class="btn tiny ghost" id="zoomIn" title="Zoom in (+). Or scroll over the waveform">+</button>
+                    <button class="btn tiny ghost" id="zoomFit" title="Whole song (0)">Fit</button>
+                  </div>
+                </div>
+                <input type="range" id="viewScroll" min="0" max="1000" value="0" hidden aria-label="Scroll the zoomed waveform" />
+              </div>
+              <div class="transport-bar">
+                <button class="btn tbtn" id="toStartBtn" type="button" title="Jump to the start" aria-label="Jump to the start">
+                  <svg viewBox="0 0 24 24"><path d="M6 5h2v14H6zM19 5v14l-11-7z"/></svg>
+                </button>
+                <button class="btn tbtn" id="rewindBtn" type="button" title="Skip back 5 s" aria-label="Skip back 5 s">
+                  <svg viewBox="0 0 24 24"><path d="M20 6v12l-8-6zM12 6v12l-8-6z"/></svg>
+                </button>
+                <button class="play" id="playBtn" aria-label="Play">
+                  <svg viewBox="0 0 24 24" class="i-play"><path d="M8 5v14l11-7z"/></svg>
+                  <svg viewBox="0 0 24 24" class="i-pause"><path d="M7 5h4v14H7zM13 5h4v14h-4z"/></svg>
+                </button>
+                <button class="btn tbtn" id="ffBtn" type="button" title="Skip forward 5 s" aria-label="Skip forward 5 s">
+                  <svg viewBox="0 0 24 24"><path d="M4 6v12l8-6zM12 6v12l8-6z"/></svg>
+                </button>
+                <button class="btn tbtn" id="toEndBtn" type="button" title="Jump to the end" aria-label="Jump to the end">
+                  <svg viewBox="0 0 24 24"><path d="M16 5h2v14h-2zM5 5v14l11-7z"/></svg>
+                </button>
+                <div class="tool loop">
+                  <button class="btn toggle" id="loopBtn" aria-pressed="false" title="Loop (L)">Loop</button>
+                  <button class="btn tiny ghost" id="setA" title="Loop start at playhead ([)">Set A</button>
+                  <button class="btn tiny ghost" id="setB" title="Loop end at playhead (])">Set B</button>
+                  <button class="btn tiny ghost" id="clearLoop" title="Remove the loop section (A and B)" hidden>Clear</button>
+                  <span class="muted small" id="loopInfo">Drag to scrub · Shift-drag to pick a section</span>
+                  <label class="snap">Snap
+                    <select id="snap"><option value="off">Off</option><option value="beat">Beat</option><option value="bar">Bar</option></select>
+                  </label>
+                </div>
+                <div class="time"><span id="timeNow">0:00</span><span class="muted"> / <span id="timeTotal">0:00</span></span></div>
+              </div>
+            </div>
+
+            <div class="markers-bar">
+              <div class="markers" id="markers"></div>
+              <button class="btn tiny ghost" id="addMarker" title="Add a section marker at the playhead (M)">+ Marker</button>
+              <span class="x-toggles">
+                <button class="btn tiny ghost toggle" id="stripBtn" type="button" aria-pressed="false" title="A scrolling row of beat boxes with the chord to play, moving in time with the music">Timeline</button>
+                <button class="btn tiny ghost toggle" id="chordsBtn" type="button" aria-pressed="false" title="Show the chords (detected, editable)">Chords</button>
+                <button class="btn tiny ghost toggle" id="notesBtn" type="button" aria-pressed="false" title="Show which notes are sounding, freeze the sound, make MIDI">Notes</button>
+              </span>
+            </div>
+
+            <div class="tools">
+            <div class="tools-sliders">
+              <div class="tool">
+                <label>Tempo <output id="tempoOut">100%</output></label>
+                <input type="range" id="tempo" min="0.5" max="1.5" step="0.01" value="1" />
+                <button class="btn tiny ghost" data-reset="tempo">Reset</button>
+              </div>
+              <div class="tool">
+                <label>Pitch <output id="pitchOut">0 st</output></label>
+                <input type="range" id="pitch" min="-12" max="12" step="1" value="0" />
+                <button class="btn tiny ghost" data-reset="pitch">Reset</button>
+              </div>
+              <div class="tool">
+                <label>Volume</label>
+                <input type="range" id="volume" min="0" max="1" step="0.01" value="0.9" />
+                <button class="btn tiny ghost toggle" id="panToggle" aria-pressed="false" title="Show left–right pan sliders on each track">Pan</button>
+              </div>
+            </div>
+            <div class="drawer">
+              <div class="drawer-tabs">
+                <button class="dtab" type="button" data-tab="practice" aria-expanded="false"><span class="chev">▸</span> Practice <span class="dsum" id="sumPractice"></span></button>
+                <button class="dtab" type="button" data-tab="beat" aria-expanded="false"><span class="chev">▸</span> Tempo &amp; key <span class="dsum" id="sumBeat"></span></button>
+                <button class="dtab" type="button" id="liveTab" data-tab="live" aria-expanded="false" hidden><span class="chev">▸</span> Live input <span class="dsum" id="sumLive"></span></button>
+                <button class="dtab" type="button" data-tab="tuner" aria-expanded="false"><span class="chev">▸</span> Tuner <span class="dsum" id="sumTuner"></span></button>
+                <button class="dtab" type="button" data-tab="scratch" aria-expanded="false"><span class="chev">▸</span> Scratchpad <span class="dsum" id="sumScratch"></span></button>
+              </div>
+              <div class="dpane" data-pane="practice" hidden>
+                <div class="tool practice">
+                  <button class="btn tiny toggle" id="trainerBtn" aria-pressed="false" title="Loop the section, speeding up after each pass">Speed trainer</button>
+                  <span class="trainer-cfg">
+                    <input type="number" id="trFrom" min="30" max="150" step="5" value="70" aria-label="Start speed" />% →
+                    <input type="number" id="trTo" min="30" max="150" step="5" value="100" aria-label="Target speed" />%,
+                    +<input type="number" id="trStep" min="1" max="25" step="1" value="5" aria-label="Step" />% every
+                    <input type="number" id="trEvery" min="1" max="10" step="1" value="1" aria-label="Passes per step" /> pass(es)
+                  </span>
+                  <label class="trainer-gate" title="Only speed up once the tab Trainer scores you this well on that many passes in a row (needs the tab's Trainer on, with Live input monitoring). Otherwise it holds the speed and you keep practising it.">
+                    <input type="checkbox" id="trGate" /> only when the tab Trainer scores ≥
+                    <input type="number" id="trGateAcc" min="50" max="100" step="5" value="90" aria-label="Accuracy needed" />%
+                  </label>
+                  <span class="muted small" id="trainerInfo"></span>
+                </div>
+                <div class="tool practice">
+                  <label>Gap
+                    <select id="gap"><option value="0">None</option><option value="1">1 s</option><option value="2">2 s</option><option value="3">3 s</option><option value="5">5 s</option></select>
+                  </label>
+                  <button class="btn tiny toggle needs-beats" id="countInBtn" aria-pressed="false" title="One bar of clicks before each loop pass and before playing">Count-in</button>
+                  <button class="btn tiny toggle needs-beats" id="clickBtn" aria-pressed="false" title="Metronome click on the beat">Click</button>
+                  <input type="range" id="clickVol" min="0.05" max="1" step="0.05" value="0.5" title="Click volume" class="needs-beats" />
+                </div>
+              </div>
+              <div class="dpane" data-pane="beat" hidden>
+                <div class="tool beat">
+                  <span id="bpmInfo" class="bpm">Tempo: not analysed</span>
+                  <button id="keyInfo" class="bpm key" type="button" hidden></button>
+                  <button class="btn tiny ghost needs-beats" id="halfBtn" title="Detected tempo is double the real one">½×</button>
+                  <button class="btn tiny ghost needs-beats" id="dblBtn" title="Detected tempo is half the real one">2×</button>
+                  <button class="btn tiny ghost needs-beats" id="tapBtn" title="Tap along to the beat 4+ times to correct the tempo">Tap</button>
+                  <label>Beats/bar
+                    <select id="perBar" class="needs-beats"><option>2</option><option>3</option><option selected>4</option><option>5</option><option>6</option><option>7</option></select>
+                  </label>
+                  <button class="btn tiny ghost needs-beats" id="shiftBar" title="Move the bar start one beat later">Bar start →</button>
+                </div>
+                <div class="tool key-panel" id="keyPanel" hidden>
+                  <div class="kp-row">
+                    <span class="muted small" id="keyWhere"></span>
+                    <div class="kp-list" id="keyList"></div>
+                  </div>
+                  <div class="kp-row">
+                    <button class="btn tiny ghost" id="keySection" hidden>Check this section only</button>
+                    <button class="btn tiny ghost" id="keyWhole" hidden>Check whole song</button>
+                    <span class="kp-set">Set key
+                      <select id="keyTonic"></select>
+                      <select id="keyMode"><option value="major">major</option><option value="minor">minor</option></select>
+                      <button class="btn tiny" id="keySet">Set</button>
+                    </span>
+                    <button class="btn tiny ghost" id="keyClose">Close</button>
+                  </div>
+                </div>
+              </div>
+              <div class="dpane" data-pane="live" hidden>
+                <div class="native-tip" id="nativeTip" hidden>
+                  <span id="nativeTipText"></span>
+                  <button class="btn tiny" type="button" id="nativeTipShow">Show me</button>
+                  <button class="btn tiny ghost" type="button" id="nativeTipDismiss">Got it</button>
+                </div>
+                <div class="tool live">
+                  <button class="btn tiny toggle" id="liveBtn" type="button" aria-pressed="false" title="Play a real instrument or mic live alongside the tracks">Monitor</button>
+                  <select id="liveDevice" title="Input device" hidden></select>
+                  <select id="liveChannel" title="Which input channel to use. An instrument in input 1 of an interface leaves the other channel silent, which halves the level in Stereo; pick Input 1 (or 2) to use just that one." hidden>
+                    <option value="stereo">Stereo</option>
+                    <option value="left">Input 1</option>
+                    <option value="right">Input 2</option>
+                    <option value="sum">Inputs 1+2 summed</option>
+                  </select>
+                  <div class="live-meter" id="liveMeter" hidden><i id="liveMeterBar"></i></div>
+                  <label class="mini vol" id="liveVolWrap" hidden><span>Level</span><input type="range" id="liveVol" min="0" max="4" step="0.01" value="0.8" /></label>
+                  <label class="mini pan" id="livePanWrap" hidden title="Pan (double-click to centre)"><span>Pan</span><input type="range" id="livePan" min="-1" max="1" step="0.05" value="0" /><output id="livePanOut">CTR</output></label>
+                  <div class="live-grp">
+                    <label class="mini latency" id="liveLatencyWrap" hidden title="How late a take lands behind the song (the delay of what you hear plus the delay of what is recorded). It is taken off the take when you stop, so it lines up. Press Measure to find it.">Latency <input type="number" id="liveLatency" min="0" max="500" step="1" value="0" /> ms</label>
+                    <button class="btn tiny ghost" id="liveLatencyBtn" type="button" hidden title="Plays clicks and listens for them on the input to measure the delay. Needs the speakers near the microphone, or a cable from the output to the input. With headphones and no cable, record a take against the click and use Line up under it instead.">Measure</button>
+                    <label class="mini" id="liveLowLatWrap" hidden title="Ask the audio system for its smallest buffers and run at the sound card's own sample rate, so what you play and hear is less delayed. Some computers may crackle; turn it off if so. Takes effect the next time you open Steminize."><input type="checkbox" id="liveLowLat" /> Low-latency audio</label>
+                  </div>
+                  <div class="live-grp live-rec">
+                    <select id="liveRecordTarget" title="Which track to record into" hidden></select>
+                    <label class="mini punch" id="livePunchWrap" hidden title="Record only across the marked loop section: playback starts a bar before it, recording runs from A to B, then stops."><input type="checkbox" id="livePunch" /> Punch in on loop</label>
+                    <button class="btn tiny toggle rec" id="liveRecordBtn" type="button" aria-pressed="false" title="Record your own take while monitoring, saved as a local audio file" hidden>● Record</button>
+                    <span class="muted small" id="liveRecordTime" hidden>0:00</span>
+                  </div>
+                  <label class="mini takes" title="Oldest take is dropped once you go over this, both here and from the library">Keep last <input type="number" id="liveMaxTakes" min="1" max="20" step="1" value="5" /> takes</label>
+                  <span class="muted small" id="liveStatus"></span>
+                </div>
+                <div class="tool live native-audio" id="nativeAudioBox" hidden>
+                  <strong class="small" title="Experimental: opens the sound card directly instead of through the webview, to see how low the delay can go. Use headphones when monitoring (feedback), and stop the Monitor above first.">Native audio (experimental)</strong>
+                  <select id="naHost" title="Audio system"></select>
+                  <span class="na-dd" id="naInputMount" title="Input device"></span>
+                  <span class="na-dd" id="naOutputMount" title="Output device"></span>
+                  <select id="naChannel" title="Input channel">
+                    <option value="0">Input 1</option>
+                    <option value="1">Input 2</option>
+                    <option value="2">Input 3</option>
+                    <option value="3">Input 4</option>
+                  </select>
+                  <select id="naBuffer" title="Buffer size in frames: smaller is lower delay but may crackle">
+                    <option value="0">Default buffer</option>
+                    <option value="32">32 frames</option>
+                    <option value="64">64 frames</option>
+                    <option value="128" selected>128 frames</option>
+                    <option value="256">256 frames</option>
+                    <option value="512">512 frames</option>
+                    <option value="1024">1024 frames</option>
+                  </select>
+                  <select id="naRate" title="Sample rate. Auto uses the chosen device's own rate, which for the pipewire / pulse devices is 44100 Hz unless the system says otherwise; if your system runs at 48000, choosing it avoids a conversion that adds delay">
+                    <option value="0">Auto rate</option>
+                    <option value="44100">44100 Hz</option>
+                    <option value="48000">48000 Hz</option>
+                    <option value="96000">96000 Hz</option>
+                  </select>
+                  <label class="mini" title="Play saved songs through the native engine on the chosen output instead of the webview. Reopen the song after switching it on; songs not saved to the library still play in the webview."><input type="checkbox" id="naPlayback" /> Use native playback</label>
+                  <button class="btn tiny ghost" id="naRefresh" type="button" title="List the devices again">Refresh</button>
+                  <button class="btn tiny toggle" id="naMonitor" type="button">Native monitor</button>
+                  <button class="btn tiny ghost" id="naLoopback" type="button" title="Plays clicks out of the chosen output and listens for them on the chosen input: patch the output to the input with a cable (gain low) and read the round trip">Loopback test</button>
+                  <span class="muted small" id="naStatus"></span>
+                  <span class="muted small na-route" id="naRoute"></span>
+                  <span class="muted small na-stats" id="naStats" hidden title="Load is how much of each audio block's time the engine uses (near 100% means it may glitch). A dropout is a block that arrived late. If either climbs, try a larger buffer."></span>
+                </div>
+              </div>
+              <div class="dpane" data-pane="tuner" hidden>
+                <div class="tool tuner">
+                  <select id="tunerSource" title="What to tune against"></select>
+                  <div class="tuner-display">
+                    <span class="tuner-note" id="tunerNote">–</span>
+                    <div class="tuner-meter"><span class="tuner-mid"></span><i id="tunerNeedle"></i></div>
+                    <span class="muted small" id="tunerHz"></span>
+                  </div>
+                  <span class="muted small" id="tunerStatus">Play a single note</span>
+                </div>
+              </div>
+              <div class="dpane" data-pane="scratch" hidden>
+                <!-- The drag handle (floating only) and the tab toolbar stick together as one unit at the
+                     top of the Scratchpad while its content scrolls underneath — wrapped so they stick as
+                     a single block instead of each needing its own top offset (the handle's own height,
+                     for the toolbar, isn't a fixed number — it can wrap to more than one line). -->
+                <div class="scratch-sticky-top" id="scratchStickyTop">
+                  <div class="scratch-float-bar" id="scratchFloatBar">
+                    <span class="scratch-float-handle" id="scratchFloatHandle">⠿ Scratchpad</span>
+                    <button class="btn tiny ghost" id="scratchDockBtn" type="button" title="Dock back into the panel">Dock</button>
+                  </div>
+                  <div class="tool scratch-tabs">
+                  <button class="btn tiny ghost" type="button" id="scratchFloatBtn" title="Pop out into a moveable, resizable window">Float ⧉</button>
+                  <button class="btn tiny ghost toggle" type="button" id="scratchTabLyrics" aria-pressed="true">Lyrics</button>
+                  <button class="btn tiny ghost toggle" type="button" id="scratchTabGuitar" aria-pressed="false" title="Guitar tab. Double-click to rename">Guitar</button>
+                  <button class="btn tiny ghost toggle" type="button" id="scratchTabBass" aria-pressed="false" title="Bass tab. Double-click to rename">Bass</button>
+                  <button class="btn tiny ghost toggle" type="button" id="scratchTabDrums" aria-pressed="false" title="Drum tab. Double-click to rename">Drums</button>
+                  <button class="btn tiny ghost" type="button" id="scratchAddPart" title="Add another part, such as a second guitar or keys">+</button>
+                  <button class="btn tiny ghost toggle" type="button" id="scratchTabNotes" aria-pressed="false">Notes</button>
+                  <span class="part-link" id="partLink" hidden>
+                    <span class="muted small">Track</span>
+                    <span id="partTrackMount" title="The track this tab is for: it is outlined in the track list, and its Tab button jumps back here"></span>
+                    <button class="btn tiny ghost toggle" type="button" id="partMuteBtn" aria-pressed="false">Play without it</button>
+                    <button class="btn tiny ghost" type="button" id="partDeleteBtn" hidden title="Delete this part and its tab">Delete part</button>
+                  </span>
+                  <a class="btn tiny ghost" id="lyricsSearchLink" href="https://genius.com/search" target="_blank" rel="noopener noreferrer" title="Search Genius for lyrics, to copy in yourself">Search lyrics ↗</a>
+                  <label class="btn tiny ghost" id="lyricsImportLabel" title="Load a synced lyrics (.lrc) file into the Lyrics box">Import .lrc…<input type="file" id="lyricsImport" accept=".lrc,.txt,text/plain" hidden /></label>
+                  <button class="btn tiny ghost toggle" type="button" id="lyricsFollowBtn" aria-pressed="false" hidden title="Show the lyrics as a follow-along view that highlights the line being sung">Follow along</button>
+                  <button class="btn tiny ghost toggle" type="button" id="lyricsChordsBtn" aria-pressed="false" hidden title="Write the chords above the words where they change (needs the song's chords: they are detected when you turn this on)">Chords</button>
+                  <span class="lyrics-nudge" id="lyricsNudge" hidden>
+                    <button class="btn tiny ghost" type="button" id="lyricsSooner" title="Show the lyrics a little sooner">−</button>
+                    <span class="muted small" id="lyricsOffsetVal" title="Timing adjustment"></span>
+                    <button class="btn tiny ghost" type="button" id="lyricsLater" title="Show the lyrics a little later">+</button>
+                  </span>
+                  <button class="btn tiny ghost" type="button" id="tabExtendBtn" title="Add more bars to every line, still lined up (or just press Tab in the box)">Extend line</button>
+                  <button class="btn tiny ghost" type="button" id="tabRhythmBtn" title="Add a rhythm line under each block of strings. Put a letter under each note for how long it lasts: w whole, h half, q quarter, e eighth, s sixteenth (add a dot for dotted; capital letter = a rest). A note with no letter repeats the last one. Timing then follows the rhythm exactly.">Add rhythm line</button>
+                  <button class="btn tiny ghost" type="button" id="tabTapBtn" hidden title="Tap this in time with the music to mark where the cursor is right now. One tap is usually enough — uses the song's own detected tempo (Tempo &amp; key) to work out everything else from the rhythm line. Tap a second spot too if the beat isn't steady enough for that alone, and timing will follow the taps instead (keyboard: Ctrl/⌘+Enter while the cursor is in the tab)">Tap ⏱</button>
+                  <span class="muted small" id="tabAnchorCount" hidden></span>
+                  <button class="btn tiny ghost toggle" type="button" id="tabFollowBtn" aria-pressed="false" hidden title="Show the tab engraved — fret numbers on a tab stave, with a rhythm row underneath showing the exact timing — and follow where you're tapped in, instead of the plain typed text">Follow along</button>
+                  <span class="tab-tap-sel" id="tabTapSel" hidden>
+                    <span class="muted small" id="tabTapSelLabel"></span>
+                    <button class="btn tiny ghost" type="button" id="tabTapLockBtn" title="Lock this tap so it can't be dragged, re-tapped over or removed">Lock</button>
+                    <button class="btn tiny ghost" type="button" id="tabTapRemoveBtn" title="Remove this tap (or press Delete)">Remove</button>
+                  </span>
+                  <button class="btn tiny ghost toggle" type="button" id="tabStaffBtn" aria-pressed="false" hidden title="Also show a full standard-notation staff underneath, with real pitches — the engraved tab above already shows the rhythm on its own. With taps set, it follows the music too.">Staff</button>
+                  <button class="btn tiny ghost toggle" type="button" id="tabTrainerBtn" aria-pressed="false" hidden title="Compare what you play against the tab in real time: right/wrong highlight on the current note plus a running accuracy count. Needs Live input monitoring running; turns Follow along on too if it wasn't already.">Trainer</button>
+                  <button class="btn tiny ghost toggle" type="button" id="tabEarBtn" aria-pressed="false" hidden title="Ear training: hide the tab while the song plays so you play it from memory — the Trainer still marks you if it's on, and the tab comes back when you pause.">Ear</button>
+                  <span class="muted small" id="tabTrainerStatus" hidden></span>
+                  <button class="btn tiny ghost" type="button" id="tabBarScoresClear" hidden title="Bar numbers on the tab are coloured by how well you played that bar the last time round (green is clean, red is missed). Hover a bar number for the count. This forgets the colours for this song.">Clear bar colours</button>
+                  <button class="btn tiny ghost" type="button" id="tabClearAnchorsBtn" hidden title="Clear this tab's timing and start tapping again">Clear timing</button>
+                  <button class="btn tiny ghost toggle" type="button" id="tabSymbolsBtn" aria-pressed="false" hidden title="A reminder of the symbols you can type in the tab: hammer-ons, bends, harmonics, picking and fingering marks, repeats and more">Symbols</button>
+                  </div>
+                </div>
+                <div class="tab-symbols" id="tabSymbols" hidden>
+                  <div>
+                    <b>Typed on the strings</b>
+                    <p><code>5h7</code> hammer-on · <code>7p5</code> pull-off · <code>5/7</code> slide up · <code>9\7</code> slide down (also across a bar line: <code>5h|7</code>) · <code>7~</code> vibrato · <code>x</code> muted · <code>t5</code> / <code>T5</code> tap</p>
+                    <p><code>7b9</code> bend · <code>7b9r7</code> bend and release · <code>7pb9</code> pre-bend · <code>7pb9r7</code> pre-bend and release</p>
+                    <p><code>12(h)</code> harmonic · <code>12(ph)</code> pinch harmonic · <code>*</code> just inside a bar line: repeat sign (<code>|*</code> start, <code>*|</code> end) — played twice by default, and Follow along and the trainer follow it</p>
+                  </div>
+                  <div>
+                    <b>On lines above or below the strings</b>, lined up with the notes (no blank line between)
+                    <p><code>D</code> pick down · <code>U</code> pick up · <code>1</code>–<code>4</code> left-hand finger · <code>[1]</code>–<code>[4]</code> right-hand finger · <code>PM----</code> palm mute, for as long as the dashes run (any number of runs, above and below) · <code>x3</code> over the bar that ends a repeat: play it three times (2–9)</p>
+                    <b>In Follow along</b>
+                    <p>click a bar number to loop that bar (Shift-click another to loop the bars between) · <b>Ear</b> hides the tab while it plays, so you play from memory</p>
+                    <b>Other lines</b>
+                    <p><code>4/4</code> on its own line above the strings fixes every bar's length · a rhythm line (<code>q e e q</code>…) under the strings gives exact lengths</p>
+                  </div>
+                </div>
+                <div class="tab-symbols" id="tabDrumSymbols" hidden>
+                  <div>
+                    <b>The drum grid</b>: one row per kit piece, one column per sixteenth note, bars between <code>|</code>
+                    <p><code>CC</code> crash · <code>RC</code> ride · <code>HH</code> hi-hat · <code>SD</code> / <code>SN</code> snare · <code>HT</code> / <code>MT</code> / <code>FT</code> high, mid and floor tom · <code>BD</code> kick</p>
+                    <p><code>x</code> a hit · <code>X</code> an accent · <code>o</code> open hi-hat (on any other row, a plain hit) · <code>g</code> a ghost note · <code>-</code> nothing</p>
+                  </div>
+                  <div>
+                    <b>Lines</b>
+                    <p><code>4/4</code> on its own line above the grid fits every bar to a whole bar however many columns it has (eight columns to a bar is fine) · <code>*</code> just inside a bar line is a repeat sign, as in a guitar tab · a counting line (<code>1 e + a</code>) above the grid is ignored</p>
+                    <b>In Follow along</b>
+                    <p>tap the first hit to time it, then play: the staff slides past the marker · click a bar number to loop that bar · <b>Ear</b> hides the staff while it plays</p>
+                  </div>
+                </div>
+                <textarea class="scratch-area" id="scratchLyrics" placeholder="Lyrics… or paste synced lyrics in LRC format ([mm:ss.xx] words) to follow along" spellcheck="true"></textarea>
+                <div class="lyrics-follow" id="lyricsFollow" hidden aria-live="off"></div>
+                <textarea class="scratch-area mono" id="scratchTab" placeholder="e|--------------------|&#10;B|--------------------|&#10;G|--------------------|&#10;D|--------------------|&#10;A|--------------------|&#10;E|--------------------|" spellcheck="false" wrap="off" hidden></textarea>
+                <div class="tab-timeline" id="tabTimeline">
+                  <!-- The engraved tab (tab stave + rhythm row under it): follow-along's read-only view for
+                       the Tab pane, replacing what used to be the plain typed text scrolled past a marker.
+                       Same view/track/cursor/notebox structure as the staff below (shared CSS classes), since
+                       both are now VexFlow-drawn notation sliding past a fixed point the same way. -->
+                  <div class="tab-strip scratch-area" id="tabStrip" hidden aria-live="off">
+                    <div class="tab-staff-view" id="tabStripView">
+                      <div class="tab-staff-track" id="tabStripTrack"></div>
+                      <div class="tab-staff-notebox" id="tabStripNoteBox" hidden></div>
+                      <!-- Click a note here (its fret number or stem, tagged with data-bar/data-col at
+                           draw time — see drawTabScore in staff.ts) to select it, shown with this
+                           outline rather than tabStripNoteBox's own fill so the two read differently if
+                           they ever land on the same note; then press w/h/q/e/s to set its length,
+                           written straight back into the rhythm line in the ASCII tab above. -->
+                      <div class="tab-staff-notebox tab-staff-editbox" id="tabStripEditBox" hidden></div>
+                      <div class="tab-staff-cursor" id="tabStripCursor" hidden></div>
+                    </div>
+                  </div>
+                  <div class="tab-staff scratch-area" id="tabStaff" hidden aria-live="off">
+                    <div class="tab-staff-view" id="tabStaffView">
+                      <div class="tab-staff-track" id="tabStaffTrack"></div>
+                      <div class="tab-staff-notebox" id="tabStaffNoteBox" hidden></div>
+                      <div class="tab-staff-cursor" id="tabStaffCursor" hidden></div>
+                    </div>
+                  </div>
+                  <!-- Shown only when the engraved tab and the full Staff are both on: one continuous line
+                       down through both, at the same fixed spot each already holds its own content at, so
+                       it's clear they're marking the same instant. -->
+                  <div class="tab-timeline-cursor" id="tabTimelineCursor" hidden></div>
+                </div>
+                <textarea class="scratch-area mono" id="scratchDrums" placeholder="CC|--------------------|&#10;HH|--------------------|&#10;SN|--------------------|&#10;HT|--------------------|&#10;FT|--------------------|&#10;BD|--------------------|" spellcheck="false" wrap="off" hidden></textarea>
+                <textarea class="scratch-area" id="scratchNotes" placeholder="Notes, song sections, anything else…" spellcheck="true" hidden></textarea>
+                <div class="scratch-resize-handle" id="scratchResizeHandle" title="Drag to resize"></div>
+              </div>
+            </div>
+          </div>
+          </div>
+
+          <div class="lanes xlanes" id="xlanes"></div>
+          <div class="lanes" id="lanes"></div>
+          <div class="shortcuts-row">
+            <p class="muted small shortcuts">Space / PageDown play · PageUp restart section · M marker · + − 0 zoom · Shift + − track height · ← → skip 5 s · L loop · [ ] loop points · F freeze · 1–6 mute · Ctrl/Cmd+Z undo mixer · +Shift redo</p>
+            <button class="btn tiny ghost toggle" id="pedalBtn" aria-pressed="false" title="For page-turner pedals that send arrow keys: right/down = play/pause, left/up = restart section">Foot pedal mode</button>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <dialog id="modelsDlg">
+      <form method="dialog" class="dlg-head">
+        <h2>Models</h2>
+        <button class="btn tiny ghost" aria-label="Close">Close</button>
+      </form>
+      <p class="muted small">Models are stored in this browser/app and reused offline. If downloads are blocked on your network, fetch the files from Hugging Face yourself and import them here (the file names must match).</p>
+      <div id="modelList"></div>
+      <div class="dlg-foot">
+        <span class="muted small" id="storageInfo"></span>
+        <label class="btn ghost">Import model file…<input type="file" id="importModel" accept=".onnx" multiple hidden /></label>
+      </div>
+    </dialog>
+
+    <dialog id="ytDlg">
+      <form method="dialog" class="dlg-head">
+        <h2>From YouTube</h2>
+        <button class="btn tiny ghost" aria-label="Close">Close</button>
+      </form>
+      <form id="ytSearchForm" class="yt-search">
+        <input type="text" id="ytSong" placeholder="Song name" autocomplete="off" />
+        <input type="text" id="ytArtist" placeholder="Artist" autocomplete="off" />
+        <button class="btn tiny primary" type="submit">Search</button>
+      </form>
+      <p class="muted small" id="ytReminder">Downloads run locally via yt-dlp, straight into the import queue.</p>
+      <p class="muted small" id="ytStatus"></p>
+      <div class="yt-results" id="ytResults"></div>
+    </dialog>
+
+    <dialog id="aboutDlg" aria-labelledby="aboutTitle">
+      <form method="dialog" class="dlg-head">
+        <h2 id="aboutTitle">About Steminize</h2>
+        <button class="btn tiny ghost" aria-label="Close">Close</button>
+      </form>
+      <div class="about-hero">
+        <img src="./icon.svg" alt="" width="48" height="48" />
+        <div>
+          <div class="about-name">Steminize <span id="aboutVersion"></span></div>
+          <div class="muted small" id="aboutBuild"></div>
+        </div>
+      </div>
+      <div class="about-update" id="aboutUpdate" hidden>
+        <button class="btn tiny ghost" id="updateBtn" type="button">Check for updates</button>
+        <span class="muted small" id="updateStatus" role="status"></span>
+        <a class="small" id="updateLink" href="https://github.com/Gerschwin/steminize/releases" target="_blank" rel="noopener noreferrer" hidden>Get it from GitHub</a>
+      </div>
+      <p class="small">Split songs into stems and practise along with them. Everything runs on your own device, and your audio never leaves it.</p>
+      <p class="small about-links">
+        <a href="https://github.com/Gerschwin/steminize" target="_blank" rel="noopener noreferrer">Project on GitHub</a>
+        <a href="https://github.com/Gerschwin/steminize/releases" target="_blank" rel="noopener noreferrer">Releases</a>
+        <a href="https://github.com/Gerschwin/steminize/issues" target="_blank" rel="noopener noreferrer">Report a problem</a>
+      </p>
+
+      <div class="m-group about-support">
+        <div class="m-group-head"><h3>Support Steminize</h3></div>
+        <p class="small muted">Steminize is free and open source, and nothing is held back behind a payment. If it's useful to you, an optional contribution helps keep it maintained.</p>
+        <a class="btn primary" href="https://www.paypal.com/ncp/payment/FZTNXUUZ3QWH6" target="_blank" rel="noopener noreferrer">Contribute via PayPal</a>
+      </div>
+
+      <div class="m-group">
+        <div class="m-group-head"><h3>What uses the network</h3></div>
+        <ul class="about-list small muted">
+          <li>初めて使うとき you choose a separation model it is downloaded from Hugging Face, then kept on this device so it works offline.</li>
+          <li>Desktop app only, and off unless you turn it on in Settings: <b>From YouTube…</b> downloads the yt-dlp tool from GitHub the first time you use it, then fetches the audio you pick from YouTube.</li>
+          <li>Desktop app only: <b>Check for updates</b> asks GitHub for the latest release number, and only when you press it.</li>
+          <li>Nothing else is sent anywhere. There is no account, tracking or analytics.</li>
+        </ul>
+      </div>
+
+      <div class="m-group">
+        <div class="m-group-head"><h3>Built with</h3></div>
+        <ul class="about-list small">
+          <li><a href="https://github.com/adefossez/demucs" target="_blank" rel="noopener noreferrer">Demucs</a> by Alexandre Défossez, Simon Rouard, Francisco Massa and Meta AI <span class="muted">· MIT</span></li>
+          <li>ONNX exports of the Demucs models by <a href="https://huggingface.co/StemSplitio" target="_blank" rel="noopener noreferrer">StemSplit</a> <span class="muted">· MIT</span></li>
+          <li><a href="https://onnxruntime.ai" target="_blank" rel="noopener noreferrer">ONNX Runtime Web</a> by Microsoft <span class="muted">· MIT</span></li>
+          <li><a href="https://github.com/spotify/basic-pitch" target="_blank" rel="noopener noreferrer">Basic Pitch</a> by Spotify, for audio-to-MIDI <span class="muted">· Apache-2.0</span></li>
+          <li><a href="https://github.com/cutterbl/SoundTouchJS" target="_blank" rel="noopener noreferrer">SoundTouchJS</a>, for tempo and pitch <span class="muted">· LGPL-2.1</span></li>
+          <li><a href="https://github.com/shijinyu/lamejs" target="_blank" rel="noopener noreferrer">lamejs</a> (@breezystack fork), for MP3 export <span class="muted">· LGPL-3.0</span></li>
+          <li><a href="https://github.com/101arrowz/fflate" target="_blank" rel="noopener noreferrer">fflate</a>, for ZIP files <span class="muted">· MIT</span></li>
+          <li>Desktop app: <a href="https://tauri.app" target="_blank" rel="noopener noreferrer">Tauri</a> <span class="muted">· MIT / Apache-2.0</span> and <a href="https://github.com/yt-dlp/yt-dlp" target="_blank" rel="noopener noreferrer">yt-dlp</a> <span class="muted">· Unlicense</span></li>
+        </ul>
+        <p class="muted small">SoundTouchJS and lamejs are used unmodified from npm; you can swap in your own build of either.</p>
+      </div>
+
+      <div class="m-group">
+        <div class="m-group-head"><h3>Troubleshooting</h3></div>
+        <p class="small muted">If something isn't working, copy this and paste it into a bug report. It describes your setup and any recent errors. It contains no songs, file names or personal information, and nothing is sent anywhere.</p>
+        <button class="btn tiny" id="diagBtn" type="button">Copy diagnostic info</button>
+        <span class="muted small" id="diagStatus" role="status"></span>
+        <details><summary class="small">Show what will be copied</summary><textarea id="diagText" readonly rows="10" spellcheck="false"></textarea></details>
+      </div>
+
+      <div class="m-group about-lic">
+        <div class="m-group-head"><h3>Licences</h3></div>
+        <details><summary class="small">Steminize · MIT</summary><pre id="licSteminize"></pre></details>
+        <details><summary class="small">Basic Pitch · Apache-2.0 (bundled model)</summary><pre id="licBasicPitch"></pre></details>
+        <p class="muted small">The other projects above are used under the licences named next to them; follow the links for their full text.</p>
+      </div>
+    </dialog>
+
+    <dialog id="helpDlg">
+      <form method="dialog" class="dlg-head">
+        <h2>Keyboard shortcuts</h2>
+        <button class="btn tiny ghost" aria-label="Close">Close</button>
+      </form>
+      <p class="muted small">Ignored while typing in a text field. A song needs to be open for most of these.</p>
+
+      <div class="m-group">
+        <div class="m-group-head"><h3>Playback</h3></div>
+        <div class="kb-list">
+          <div class="kb-row"><kbd>Space</kbd><span>Play / pause</span></div>
+          <div class="kb-row"><kbd>Page&nbsp;Down</kbd><span>Play / pause</span></div>
+          <div class="kb-row"><kbd>Page&nbsp;Up</kbd><span>Restart the section (or the song, with no section)</span></div>
+          <div class="kb-row"><kbd>Home</kbd><span>Restart the section (or the song, with no section)</span></div>
+          <div class="kb-row"><kbd>←</kbd><span>Skip back 5 seconds</span></div>
+          <div class="kb-row"><kbd>→</kbd><span>Skip forward 5 seconds</span></div>
+        </div>
+      </div>
+
+      <div class="m-group">
+        <div class="m-group-head"><h3>Loop &amp; markers</h3></div>
+        <div class="kb-list">
+          <div class="kb-row"><kbd>L</kbd><span>Toggle loop</span></div>
+          <div class="kb-row"><kbd>[</kbd><span>Set loop point A at the playhead (turns loop on)</span></div>
+          <div class="kb-row"><kbd>]</kbd><span>Set loop point B at the playhead (turns loop on)</span></div>
+          <div class="kb-row"><kbd>M</kbd><span>Add a section marker at the playhead</span></div>
+          <div class="kb-row"><kbd>F</kbd><span>Freeze (Notes view): hold the sound at the playhead</span></div>
+        </div>
+      </div>
+
+      <div class="m-group">
+        <div class="m-group-head"><h3>Zoom &amp; tracks</h3></div>
+        <div class="kb-list">
+          <div class="kb-row"><kbd>+</kbd><span>Zoom in</span></div>
+          <div class="kb-row"><kbd>−</kbd><span>Zoom out</span></div>
+          <div class="kb-row"><kbd>0</kbd><span>Zoom to fit</span></div>
+          <div class="kb-row"><kbd>Shift</kbd><kbd>+</kbd><span>Make every track taller</span></div>
+          <div class="kb-row"><kbd>Shift</kbd><kbd>−</kbd><span>Make every track shorter</span></div>
+          <div class="kb-row"><kbd>1</kbd>–<kbd>6</kbd><span>Mute track 1 through 6</span></div>
+          <div class="kb-row"><kbd>Drag</kbd><span>Scrub: move through the song by dragging a waveform, with a short preview sound even when paused</span></div>
+          <div class="kb-row"><kbd>Shift</kbd>+drag<span>Pick a loop section instead of scrubbing</span></div>
+          <div class="kb-row"><kbd>Ctrl</kbd>/<kbd>⌘</kbd><kbd>Enter</kbd><span>In the Scratchpad's Tab box: tap the current playback time onto the text cursor (same as Tap ⏱)</span></div>
+          <div class="kb-row"><kbd>Delete</kbd><span>Remove the selected tab tap (click its green T-tag on the overview first; drag a tag to move it, Lock to protect it)</span></div>
+          <div class="kb-row"><kbd>q</kbd><kbd>e</kbd><kbd>s</kbd><span>Tab rhythm line (last line under the strings): w whole, h half, q quarter, e eighth, s sixteenth, a dot after = dotted, CAPITAL = rest. Set with "Add rhythm line".</span></div>
+          <div class="kb-row"><kbd>Staff</kbd><span>In the Tab pane: also show a full standard-notation staff underneath the engraved tab, built from the fret numbers and the rhythm line (guitar written an octave up, as usual). Follows the music when the tab has taps set, with one line marking the position across both.</span></div>
+          <div class="kb-row"><kbd>Ctrl</kbd>/<kbd>⌘</kbd><kbd>Z</kbd><span>Undo the last mixer change (mute, solo, volume, pan, EQ)</span></div>
+          <div class="kb-row"><kbd>Ctrl</kbd>/<kbd>⌘</kbd><kbd>Shift</kbd><kbd>Z</kbd><span>Redo</span></div>
+        </div>
+      </div>
+
+      <div class="m-group">
+        <div class="m-group-head"><h3>Notes view: computer keyboard as a piano</h3></div>
+        <p class="muted small">While the Notes panel is open, laid out like a real piano: the bottom row is the white keys, the row above sits over the gaps for the black keys.</p>
+        <div class="kb-list">
+          <div class="kb-row"><kbd>Z</kbd><kbd>X</kbd><kbd>C</kbd><kbd>V</kbd><kbd>B</kbd><kbd>N</kbd><kbd>M</kbd><kbd>,</kbd><kbd>.</kbd><kbd>/</kbd><span>White keys</span></div>
+          <div class="kb-row"><kbd>S</kbd><kbd>D</kbd><kbd>G</kbd><kbd>H</kbd><kbd>J</kbd><kbd>L</kbd><kbd>;</kbd><span>Black keys</span></div>
+        </div>
+      </div>
+
+      <div class="m-group">
+        <div class="m-group-head"><h3>Hands-free</h3></div>
+        <div class="kb-list">
+          <div class="kb-row"><kbd>Page&nbsp;Down</kbd><span>Play / pause — works with most Bluetooth page-turner pedals</span></div>
+          <div class="kb-row"><kbd>Page&nbsp;Up</kbd><span>Restart the section</span></div>
+          <div class="kb-row"><span class="muted small">With "Foot pedal mode" on (below the tracks): → / ↓ / Enter play, ← / ↑ restart the section.</span></div>
+        </div>
+      </div>
+    </dialog>
+
+    <div class="toasts" id="toasts" aria-live="polite"></div>
+    <script type="module" src="./src/main.ts"></script>
+  </body>
+</html>

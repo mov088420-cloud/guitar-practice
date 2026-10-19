@@ -1,0 +1,1059 @@
+:root {
+  --bg: #09090d;
+  --panel: #131319;
+  --panel-2: #1a1a22;
+  --line: #27272f;
+  --text: #f2f2f6;
+  --muted: #8d8d99;
+  --accent: #f0a838;
+  --accent-2: #ffc266;
+  --loop: #22d3ee; /* loop section on the waveforms: distinct from the played colour, markers and playhead */
+  --ok: #34d399;
+  --warn: #fbbf24;
+  --bad: #f87171;
+  --radius: 14px;
+  --shadow: 0 12px 34px rgba(0, 0, 0, 0.5);
+  color-scheme: dark;
+}
+/* Dark is the default and the system's light/dark setting is ignored (a rule that followed it made the page flash light
+   for a moment before the script picked dark). Light only comes from an explicit choice, data-theme='light' on <html>,
+   which an inline script in index.html sets before the first paint. */
+:root[data-theme='light'] {
+  --bg: #f5f6fa;
+  --panel: #ffffff;
+  --panel-2: #f0f1f6;
+  --line: #dfe2ea;
+  --text: #151821;
+  --muted: #5f677a;
+  --accent: #c97a1a;
+  --accent-2: #a8630f;
+  --loop: #0891b2; /* loop section on the waveforms: distinct from the played colour, markers and playhead */
+  --shadow: 0 10px 30px rgba(20, 24, 40, 0.12);
+  color-scheme: light;
+}
+/* The Scratchpad's own content — the text boxes and the engraved tab/staff views, anywhere fret
+   numbers or other typed text actually renders — always renders light, regardless of the app's own
+   theme: a workaround for the tab+ engraved view's fret numbers going invisible in dark mode on one
+   real device (Linux/WebKitGTK; never reproduced elsewhere, and multiple targeted rendering fixes
+   didn't resolve it there either). Same variables as :root[data-theme='light'] above, re-declared
+   directly on the content containers (.scratch-area covers every text box and both engraved views
+   alike; .lyrics-follow and .tab-timeline are their own read-only-view siblings, not .scratch-area
+   themselves) rather than the whole panel, so the toolbar above them — Float, the pane switcher, Tap/
+   Follow along/Staff/Trainer and the rest — keeps following the app's real theme same as everywhere
+   else. Revisit if the underlying WebKitGTK cause is ever found. */
+.dpane[data-pane='scratch'] .scratch-area,
+.dpane[data-pane='scratch'] .lyrics-follow,
+.dpane[data-pane='scratch'] .tab-timeline {
+  --bg: #f5f6fa;
+  --panel: #ffffff;
+  --panel-2: #f0f1f6;
+  --line: #dfe2ea;
+  --text: #151821;
+  --muted: #5f677a;
+  --accent: #c97a1a;
+  --accent-2: #a8630f;
+  --loop: #0891b2;
+  --shadow: 0 10px 30px rgba(20, 24, 40, 0.12);
+  color-scheme: light;
+}
+
+* { box-sizing: border-box; }
+/* A themed, always-reserved-space scrollbar everywhere, instead of the platform default. Doesn't
+   fix WebKitGTK on its own — GTK's overlay scrollbar there turned out to apply at the toolkit level,
+   below any page CSS, so it still floated over content regardless of this (see the Rust-side
+   GTK_OVERLAY_SCROLLING env var in lib.rs, which is the part that actually fixes that). Kept because
+   it's still the real fix for Chromium/WKWebView/Firefox, and matches the GTK-classic look once
+   GTK_OVERLAY_SCROLLING takes over on Linux. */
+* { scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb { background: var(--line); border-radius: 6px; }
+*::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+/* Scrolling a nested box (the library list, a dropdown, a dialog, ...) to its own end shouldn't
+   then start scrolling whatever's behind/around it — no-op on anything that isn't itself a scroll
+   container, so it's safe to set everywhere rather than remembering it per scrollable element. */
+* { overscroll-behavior: contain; }
+html, body { margin: 0; height: 100%; }
+/* The interface isn't text to select: dragging a resize handle, a slider or a waveform otherwise starts a selection that sweeps blue across whatever the pointer crosses, and WebKit can lift it as a ghost image. Text you type, paste or copy (fields, notes, diagnostics, licence text) stays selectable. */
+body { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+input, textarea, select, [contenteditable], pre, #diagText, .selectable { -webkit-user-select: text; user-select: text; }
+button, a, label { -webkit-user-drag: none; }
+body.modal-open { overflow: hidden; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.45 system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+h1, h2 { margin: 0; line-height: 1.2; }
+h1 { font-size: 22px; font-weight: 650; }
+h2 { font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+.muted { color: var(--muted); }
+.small { font-size: 12px; }
+button, select, input { font: inherit; color: inherit; }
+[hidden] { display: none !important; }
+
+/* ---------- top bar ---------- */
+.top {
+  position: sticky; top: 0; z-index: 5;
+  display: flex; align-items: center; gap: 16px;
+  padding: 10px max(16px, env(safe-area-inset-right)) 10px max(16px, env(safe-area-inset-left));
+  background: color-mix(in srgb, var(--bg) 85%, transparent);
+  backdrop-filter: blur(10px);
+  border-bottom: 1px solid var(--line);
+}
+.brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 17px; letter-spacing: -0.01em; }
+.ver { font-size: 11px; font-weight: 500; color: var(--muted); margin-left: -4px; align-self: flex-end; margin-bottom: 3px; }
+.chips { display: flex; gap: 6px; flex: 1; flex-wrap: wrap; }
+.chip { font-size: 12px; padding: 3px 9px; border-radius: 99px; background: var(--panel-2); border: 1px solid var(--line); color: var(--muted); white-space: nowrap; }
+.chip.ok { color: var(--ok); }
+.chip.gpu { color: var(--accent-2); }
+.chip-info {
+  display: flex; align-items: center; justify-content: center; width: 20px; height: 20px; padding: 0;
+  border-radius: 99px; background: var(--panel-2); border: 1px solid var(--warn); color: var(--warn);
+  font-size: 12px; font-weight: 700; cursor: pointer; line-height: 1;
+}
+.chip-info:hover { background: color-mix(in srgb, var(--warn) 16%, var(--panel-2)); }
+.top-actions { display: flex; gap: 8px; }
+.btn.icon { padding: 8px; }
+#themeBtn .i-sun { display: none; }
+#themeBtn.is-light .i-moon { display: none; }
+#themeBtn.is-light .i-sun { display: block; }
+@media (max-width: 600px) {
+  #privacyChip { display: none; }
+  .brand span { display: none; }
+}
+
+/* ---------- buttons & inputs ---------- */
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  padding: 8px 14px; border-radius: 9px; border: 1px solid var(--line);
+  background: var(--panel-2); cursor: pointer; font-weight: 550; white-space: nowrap;
+  transition: background 0.15s, border-color 0.15s, transform 0.05s;
+}
+.btn:hover { border-color: color-mix(in srgb, var(--accent) 50%, var(--line)); }
+.btn:active { transform: translateY(1px); }
+.btn:disabled { opacity: 0.5; cursor: default; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn.primary:hover { background: var(--accent-2); }
+.btn.ghost { background: transparent; }
+.btn.tiny { padding: 4px 9px; font-size: 12px; border-radius: 7px; }
+.btn.toggle[aria-pressed='true'] { background: color-mix(in srgb, var(--accent) 22%, transparent); border-color: var(--accent); color: var(--accent-2); }
+.btn.toggle.rec { border-color: color-mix(in srgb, var(--bad) 55%, var(--line)); color: var(--bad); }
+.btn.toggle.rec:hover { border-color: var(--bad); }
+.btn.toggle.rec[aria-pressed='true'] { background: #ef4444; border-color: #ef4444; color: #fff; animation: rec-pulse 1.4s ease-in-out infinite; }
+@keyframes rec-pulse { 50% { opacity: 0.65; } }
+select {
+  width: 100%; padding: 7px 10px; border-radius: 8px; border: 1px solid var(--line);
+  background: var(--panel-2);
+}
+
+/* ---------- custom dropdown (createDropdown in ui/dropdown.ts) ----------
+   A same-look-everywhere stand-in for <select>: a real <select>'s open list is drawn by the OS,
+   not the page, so it doesn't take the theme (checked in both Chromium and WebKitGTK — plain
+   white either way). Used only where that actually matters (currently just the Setlist card). */
+.dd { position: relative; width: 100%; }
+.dd-btn {
+  width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 8px; text-align: left;
+  padding: 7px 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel-2); color: inherit;
+  font: inherit; cursor: pointer;
+}
+.dd-btn:disabled { opacity: 0.5; cursor: default; }
+.dd-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.dd-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dd-chev { flex: none; opacity: 0.7; }
+.dd-list {
+  position: absolute; z-index: 20; left: 0; right: 0; top: calc(100% + 4px); margin: 0; padding: 4px; list-style: none;
+  max-height: 260px; overflow-y: auto; border-radius: 10px; border: 1px solid var(--line); background: var(--panel);
+  box-shadow: var(--shadow);
+}
+.dd-list.dd-up { top: auto; bottom: calc(100% + 4px); }
+.dd-opt { padding: 7px 9px; border-radius: 7px; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dd-opt.hl { background: color-mix(in srgb, var(--accent) 20%, transparent); }
+.dd-opt[aria-selected='true'] { font-weight: 600; }
+.dd-opt.disabled { opacity: 0.5; cursor: default; }
+input[type='range'] { width: 100%; accent-color: var(--accent); }
+output { color: var(--text); font-variant-numeric: tabular-nums; font-weight: 600; }
+
+/* ---------- layout ---------- */
+html, body { min-width: 320px; }
+/* gap and padding-right both trimmed to 14px, matching .side/.stage's own scrollbar buffer below —
+   so there's the same, deliberate 14px on *both* sides of a pane's scrollbar (content before it,
+   window edge or the next column after it) instead of the buffer plus this grid's separate 20px. */
+.layout { display: grid; grid-template-columns: 360px 1fr; gap: 14px; padding: 20px 14px 20px 0; }
+.side { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.side-tabs { display: flex; gap: 4px; background: var(--panel); border: 1px solid var(--line); border-radius: 11px; padding: 4px; }
+.stab { flex: 1; border: 0; background: transparent; padding: 7px; border-radius: 8px; font-weight: 600; cursor: pointer; color: var(--muted); }
+.stab[aria-selected='true'] { background: var(--accent); color: #fff; }
+.side-pane { display: flex; flex-direction: column; gap: 14px; }
+.use-sum { margin: -4px 2px 0; }
+.linkish { border: 0; background: none; color: var(--accent-2); cursor: pointer; padding: 0; font: inherit; text-decoration: underline; }
+.drawer { display: flex; flex-direction: column; gap: 10px; }
+.drawer-tabs { display: flex; gap: 8px; flex-wrap: wrap; }
+.dtab { display: inline-flex; align-items: center; gap: 6px; height: 30px; padding: 0 12px; border-radius: 9px; border: 1px solid var(--line); background: var(--panel-2); cursor: pointer; font-weight: 600; font-size: 13px; }
+.dtab[aria-expanded='true'] { border-color: var(--accent); }
+.chev { display: inline-block; transition: transform 0.15s; font-size: 11px; color: var(--muted); }
+.dtab[aria-expanded='true'] .chev { transform: rotate(90deg); }
+.dsum { font-weight: 500; color: var(--muted); font-size: 12px; }
+.dsum.on { color: var(--accent-2); }
+.dpane { display: flex; flex-direction: column; gap: 10px; }
+.stage { min-width: 0; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px; }
+.card-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+@media (max-width: 900px) {
+  .layout { grid-template-columns: 1fr; padding: 12px 16px; }
+  .stage { order: -1; }
+  .welcome { display: none; }
+}
+/* Above the breakpoint where the two columns sit side by side, let each scroll on its own instead
+   of one long page: useful once either the song list or the open song's tracks run tall. Left
+   alone below it, where .layout stacks into a single column and there's no "two panes" to split. */
+@media (min-width: 901px) {
+  html, body { height: 100%; overflow: hidden; }
+  body { display: flex; flex-direction: column; }
+  .layout { flex: 1; min-height: 0; overflow: hidden; }
+  /* Only vertical scrolling is ever intended here (that's the whole point of splitting the two
+     panes) — overflow-x:hidden stops a stray wide child from silently opting these into a second,
+     horizontal scrollbar too, since setting overflow-y alone makes a browser treat overflow-x as
+     auto rather than its default visible.
+     padding-right: a dedicated empty strip for the scrollbar to float over. GTK's overlay scrollbar
+     (WebKitGTK, the Linux desktop app's webview) auto-hides and draws on top of content rather than
+     reserving its own space, so without this it can cover whatever sits closest to the pane's edge
+     (the Songs/Settings tabs, the drop zone, deck buttons). Forcing GTK to a classic, space-reserving
+     scrollbar was tried instead (see lib.rs) but its width comes from the GTK theme, ignores this
+     app's CSS, and was measurably wider than intended — plain padding here is fully our own, so it's
+     predictable and actually testable. */
+  .side, .stage { height: 100%; overflow-y: auto; overflow-x: hidden; padding-right: 14px; }
+  /* .side's own left edge is the window's left edge — that 20px used to be .layout's own padding,
+     sitting outside .side entirely (not part of its scrollable box), so scrolling in that strip hit
+     nothing scrollable and did nothing. Moved in here instead, same as the scrollbar buffer above,
+     so that strip is genuinely part of .side and scrolls it like the rest of the pane does. */
+  .side { padding-left: 20px; }
+  /* Stays put at the top of its own pane while the song list scrolls under it, same as .top does for the page. */
+  .side-tabs { position: sticky; top: 0; z-index: 1; background: var(--bg); }
+  /* Same idea for the open song: everything above the actual tracks (title, waveform overview,
+     transport, loop, markers, tempo/pitch/volume and the tool drawer) stays put while just the
+     lanes scroll underneath. An open drawer pane (Scratchpad especially) makes this tall, leaving
+     less room for tracks below it — a deliberate trade-off, not an oversight.
+     margin-top/padding-top: -19px pulls it flush with .deck's own top border+padding (1px + 18px)
+     before adding that back as its own padding — otherwise .deck's border and padding sit *above*
+     the sticky element, so the first ~19px of scrolling drags it along before it "catches" and
+     sticks, instead of holding still from the first pixel. Deliberately top-only, not all four
+     sides: doing the same left/right would pull .deck-top flush with .deck's rounded outer corners
+     too, and being a plain rectangular box (no border-radius of its own) it would then square off
+     what should be a rounded card. overflow-x:hidden avoids the same auto-on-both-axes trap as
+     above: without it, content too wide for the pane (rare, but possible with a tall drawer's own
+     scrollbar narrowing things further) opened a confusing second, horizontal scrollbar on top of
+     the vertical one instead of just being clipped — there's no useful reason to scroll this row
+     sideways. */
+  .deck-top {
+    position: sticky; top: 0; z-index: 2; background: var(--panel);
+    max-height: calc(100vh - 40px); overflow-y: auto; overflow-x: hidden;
+    margin-top: -19px; padding-top: 19px; margin-bottom: -12px; padding-bottom: 12px;
+    border-bottom: 1px solid var(--line);
+  }
+}
+
+/* ---------- drop zone ---------- */
+.drop {
+  display: flex; flex-direction: column; align-items: center; gap: 4px; text-align: center;
+  padding: 22px 16px; border-radius: var(--radius); cursor: pointer;
+  border: 1.5px dashed color-mix(in srgb, var(--accent) 45%, var(--line));
+  background: color-mix(in srgb, var(--accent) 6%, var(--panel));
+  transition: background 0.15s, border-color 0.15s;
+}
+.multi { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: -8px; }
+.multi .muted { grid-column: 1 / -1; }
+.multi .btn { justify-content: center; }
+.drop svg { color: var(--accent-2); margin-bottom: 4px; }
+.drop span { color: var(--muted); font-size: 12px; }
+.drop:hover, .drop.over { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 14%, var(--panel)); }
+body.dragging .drop { border-color: var(--accent); }
+
+/* ---------- queue ---------- */
+.queue { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.empty { margin: 4px 0 0; }
+.q-actions { display: flex; align-items: center; gap: 8px; }
+.switch { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--muted); cursor: pointer; user-select: none; }
+.switch input { accent-color: var(--accent); margin: 0; }
+.q-bar { display: flex; flex-wrap: wrap; gap: 6px; }
+.q-bar:has(> :not([hidden])) { margin-bottom: 8px; }
+/* Caps how tall the library (and setlist) list can grow before it scrolls internally, instead of
+   growing unbounded and pushing everything below it — the Setlist card especially — further down
+   the left pane the more songs pile up. overflow-x:hidden avoids the same auto-on-both-axes trap
+   documented elsewhere in this file: setting only overflow-y makes a browser treat overflow-x as
+   auto too, and the .track fix below should mean there's nothing left to scroll to sideways anyway.
+   padding-right: the same scrollbar buffer as .side/.stage — without it this list's own scrollbar
+   sits flush against each row's text/buttons instead of the pane's actual edge. */
+.lib { max-height: 320px; overflow-y: auto; overflow-x: hidden; padding-right: 14px; }
+.lib .track { cursor: pointer; }
+.lib .track:hover { border-color: var(--line); }
+.lib .t-sub { color: var(--muted); }
+.t-x.confirm { color: var(--bad); font-size: 12px; font-weight: 600; }
+.t-set { font-size: 11px; color: var(--muted); grid-column: 1; }
+.lanes-head { display: flex; justify-content: flex-end; margin-bottom: -8px; }
+.lanes:not(.show-pan) .mini.pan { display: none; }
+.track {
+  /* minmax(0, 1fr), not a bare 1fr: a grid track's automatic minimum size is its content's
+     min-content width, which for a nowrap/ellipsis title is its full unbroken text width — so
+     without this, a long title never actually shrinks, the row's natural width exceeds its
+     container once one's narrow enough (the library list's own scrollbar taking a few px was
+     enough to tip it over), and .track's own overflow:hidden below clips the excess — the ×/↑↓
+     buttons, since they come after the title. minmax(0, 1fr) lets the title's column actually
+     shrink to fit, so text-overflow:ellipsis kicks in instead of the row overflowing. */
+  /* flex-shrink:0: .queue is a column flex container, and once .lib gives it a real max-height to
+     overflow (rather than growing forever), the *default* flex-shrink:1 kicks in — every row gets
+     proportionally squashed below its own natural content height to fit, instead of just scrolling
+     with each row at full size. That's the "crushed"/title-and-subtitle-overlapping look: two lines
+     forced into less than two lines' height, with .track's own overflow:hidden clipping the rest. */
+  /* overflow:clip, not overflow:hidden: this only exists to clip .bar (the absolutely-positioned
+     processing-progress strip) to the row's rounded corners — but overflow:hidden, per spec,
+     establishes a "scroll container" even though nothing here is meant to be scrollable, and reports
+     were that wheel-scrolling the library/setlist list stopped working specifically when the cursor
+     was over a row (worked fine over the gaps between rows) — plausibly WebKitGTK's wheel routing
+     hitting that non-interactive scroll container on .track and stopping there, instead of bubbling
+     to .lib. overflow:clip clips the same way without establishing a scroll container at all. */
+  position: relative; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 8px; align-items: center;
+  flex-shrink: 0; padding: 9px 10px 11px; border-radius: 9px; background: var(--panel-2); border: 1px solid transparent; overflow: clip;
+}
+.track.done { cursor: pointer; }
+.track.done:hover { border-color: var(--line); }
+.track.active { border-color: var(--accent); }
+/* overflow:clip, not overflow:hidden — same reasoning as .track just above: reported as scrolling
+   now working everywhere except the title's own line, the one remaining overflow:hidden element in
+   a row (confirmed text-overflow:ellipsis still renders correctly with clip instead). */
+.t-name { font-weight: 600; overflow: clip; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.t-name-edit { font-weight: 600; font-size: inherit; width: 100%; border: 0; outline: 1px solid var(--accent); background: var(--panel); border-radius: 4px; padding: 1px 5px; color: inherit; }
+.t-sub { font-size: 12px; color: var(--muted); grid-column: 1; }
+.track.error .t-sub { color: var(--bad); }
+.track.done .t-sub { color: var(--ok); }
+.t-x { grid-row: 1 / span 2; grid-column: 2; background: none; border: 0; color: var(--muted); cursor: pointer; padding: 4px 6px; border-radius: 6px; font-size: 16px; line-height: 1; }
+.t-x:hover { color: var(--text); background: var(--line); }
+.bar { position: absolute; left: 0; right: 0; bottom: 0; height: 3px; background: transparent; }
+.bar i { display: block; height: 100%; width: 0; background: var(--accent); transition: width 0.25s; }
+.bar.indet i { width: 30% !important; animation: indet 1.2s ease-in-out infinite; }
+@keyframes indet { from { transform: translateX(-100%); } to { transform: translateX(340%); } }
+
+/* ---------- settings ---------- */
+.field { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
+.field.row { flex-direction: row; flex-wrap: wrap; gap: 10px; }
+.field.row label { flex: 1 1 140px; display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+.label { font-size: 12px; color: var(--muted); display: flex; justify-content: space-between; }
+.model-cards { display: flex; flex-direction: column; gap: 6px; }
+.model-card {
+  text-align: left; padding: 9px 11px; border-radius: 9px; border: 1px solid var(--line); background: var(--panel-2); cursor: pointer;
+  display: grid; grid-template-columns: 1fr auto; gap: 2px 8px;
+}
+.model-card b { font-weight: 600; }
+.model-card .meta { font-size: 11px; color: var(--muted); align-self: center; }
+.model-card p { grid-column: 1 / -1; margin: 0; font-size: 12px; color: var(--muted); }
+.model-card[aria-pressed='true'] { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, var(--panel-2)); }
+.model-card .have { color: var(--ok); }
+.stem-toggles { display: flex; flex-wrap: wrap; gap: 6px; }
+.stem-chip { padding: 3px 10px; border-radius: 99px; border: 1px solid var(--line); background: transparent; cursor: pointer; font-size: 12px; }
+.stem-chip[aria-pressed='true'] { background: color-mix(in srgb, var(--c) 20%, transparent); border-color: var(--c); }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 9px; overflow: hidden; align-self: flex-start; }
+.seg button { border: 0; background: transparent; padding: 6px 14px; cursor: pointer; font-weight: 550; }
+.seg button + button { border-left: 1px solid var(--line); }
+.seg button[aria-pressed='true'] { background: var(--accent); color: #fff; }
+details.more { border-top: 1px solid var(--line); padding-top: 10px; margin-top: 4px; }
+details.more summary { cursor: pointer; font-weight: 600; margin-bottom: 10px; color: var(--muted); font-size: 13px; }
+details.more[open] summary { color: var(--text); }
+.estimate { margin: 8px 0 0; font-size: 12px; color: var(--muted); }
+
+/* ---------- welcome ---------- */
+.welcome { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 36px; }
+.welcome h1 { font-size: 30px; letter-spacing: -0.02em; }
+.lead { font-size: 16px; color: var(--muted); max-width: 60ch; }
+.steps { padding-left: 20px; display: grid; gap: 8px; margin: 22px 0; }
+.steps li::marker { color: var(--accent-2); font-weight: 700; }
+.draft-tag { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 0 6px; margin-left: 4px; vertical-align: 1px; cursor: help; }
+.start-row { display: flex; flex-wrap: wrap; gap: 10px; margin: 22px 0 6px; }
+.welcome-sub { font-size: 14px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 26px 0 6px; font-weight: 600; }
+.welcome-model { max-width: 62ch; margin: 0 0 8px; }
+.can-do { padding-left: 20px; display: grid; gap: 6px; margin: 6px 0 0; }
+.can-do li::marker { color: var(--accent-2); }
+
+/* ---------- deck ---------- */
+.deck { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); padding: 18px; display: flex; flex-direction: column; gap: 16px; }
+.deck-top { display: flex; flex-direction: column; gap: 16px; }
+.deck-head { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; align-items: flex-start; }
+.deck-head h1 { overflow-wrap: anywhere; cursor: text; }
+.title-edit { font-size: 22px; font-weight: 650; width: 100%; max-width: 480px; border: 0; outline: 1px solid var(--accent); background: var(--panel-2); border-radius: 6px; padding: 2px 8px; color: inherit; }
+.deck-head p { margin: 4px 0 0; }
+.deck-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.transport { display: flex; flex-direction: column; gap: 10px; }
+.transport-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.play { width: 48px; height: 48px; border-radius: 50%; border: 0; background: var(--accent); color: #fff; cursor: pointer; display: grid; place-items: center; box-shadow: var(--shadow); }
+.play svg { width: 24px; height: 24px; fill: currentColor; }
+.play .i-pause, .play.on .i-play { display: none; }
+.play.on .i-pause { display: block; }
+.tbtn { width: 36px; height: 36px; border-radius: 50%; padding: 0; }
+.tbtn svg { width: 20px; height: 20px; fill: currentColor; }
+.time { font-variant-numeric: tabular-nums; font-weight: 600; min-width: 92px; margin-left: auto; }
+.overview { height: 64px; position: relative; border-radius: 8px; background: var(--panel-2); overflow: hidden; cursor: crosshair; touch-action: none; -webkit-user-select: none; user-select: none; }
+.overview canvas, .lane canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+/* WebKit lets a canvas (like an image) be picked up and dragged as a ghost image of itself, which showed up as the waveform following the mouse across the page. -webkit-user-drag:none is its own switch for exactly that; user-select/dragstart alone didn't stop it reliably. */
+canvas, img, svg { -webkit-user-drag: none; user-drag: none; }
+@media (max-width: 600px) {
+  .deck-actions { width: 100%; }
+  .deck-actions .btn { flex: 1; }
+}
+.tools { display: flex; flex-direction: column; gap: 10px; }
+.tools-sliders { display: flex; flex-wrap: wrap; gap: 10px; }
+.tool { display: flex; align-items: center; gap: 8px; background: var(--panel-2); border-radius: 9px; padding: 8px 10px; }
+.tool.loop, .tool.practice, .tool.beat, .tool.live, .tool.tuner, .tool.scratch-tabs { flex-wrap: wrap; grid-column: 1 / -1; }
+.tuner-display { display: flex; flex-direction: column; align-items: center; gap: 4px; flex: 1; min-width: 160px; }
+.tuner-note { font-size: 26px; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; }
+.tuner-meter { position: relative; width: 100%; max-width: 220px; height: 8px; background: var(--panel); border-radius: 4px; }
+.tuner-mid { position: absolute; left: 50%; top: -3px; bottom: -3px; width: 2px; background: var(--line); transform: translateX(-50%); }
+.tuner-meter i { position: absolute; top: -4px; width: 10px; height: 16px; border-radius: 3px; background: var(--warn); left: 50%; transform: translateX(-50%); transition: left 0.08s linear; }
+.tuner-meter i.in-tune { background: var(--ok); }
+#tunerHz { min-height: 1.4em; }
+.scratch-area {
+  width: 100%; min-height: 180px; padding: 10px 12px; border-radius: 9px;
+  border: 1px solid var(--line); background: var(--panel-2); color: var(--text);
+  font: inherit; resize: vertical;
+}
+.scratch-area.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; line-height: 1.5; white-space: pre; overflow-x: auto; }
+
+/* ---------- Scratchpad, popped out into a free-floating window ----------
+   position:fixed *should* escape .stage's scroll clipping and position relative to the viewport —
+   nothing here uses transform/filter/contain, which is what's supposed to break that — but WebKitGTK
+   (the Linux desktop webview) visibly clipped/constrained it to the pinned top area regardless, and
+   dragging was intermittent with it (plausibly the same issue: the panel's actual rendered position
+   drifting from what offsetLeft/Top report). deck.ts's initScratchFloat() sidesteps this rather than
+   relying on position:fixed's cross-engine guarantees: while floating, the panel is physically moved
+   to be a direct child of <body>, so there is no ancestor left to disagree about. Its resize handle
+   (below) is custom-built for the same reason: WebKitGTK didn't reliably show/support native
+   `resize`, so this doesn't depend on it either. */
+.scratch-float-bar {
+  display: none; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 7px 8px 7px 12px; border-radius: var(--radius) var(--radius) 0 0;
+  background: var(--panel-2); cursor: move; user-select: none; touch-action: none;
+}
+.scratch-float-handle { font-size: 13px; font-weight: 600; color: var(--muted); letter-spacing: 0.02em; }
+.dpane[data-pane='scratch'].floating {
+  position: fixed; z-index: 30; width: 420px; height: 480px; min-width: 300px; min-height: 240px;
+  margin: 0; padding: 10px; overflow-y: auto; overflow-x: hidden;
+  background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow);
+}
+.dpane[data-pane='scratch'].floating .scratch-float-bar { display: flex; }
+/* Docked, the pane sits inside .deck-top, which stays pinned (position:sticky) to the top of .stage
+   while everything below it — the tracks — scrolls underneath. Left to grow with its content the way
+   it used to, a tall Scratchpad (easy to get to now, between the tab views and the staff) would inflate
+   how much of the sticky header there is to scroll past just to reach the tracks. Capped and scrolling
+   internally instead, the same way the library and setlist lists are. */
+.dpane[data-pane='scratch']:not(.floating) { max-height: 420px; overflow-y: auto; overflow-x: hidden; }
+/* Both docked and floating: the drag handle + toolbar (#scratchStickyTop) stay in view at the top of
+   the Scratchpad's own scrollbar while everything below it — whichever tab content is open — scrolls
+   underneath, the same way .side-tabs and .deck-top do for their own panes. Content is left to its
+   natural height rather than fighting it for space with flex:1/flex-shrink tricks (an earlier version
+   of this split the engraved tab and the full staff's height evenly between them regardless of what
+   either actually needed, and separately could clip the bottom of whichever one lost that split with
+   no way to reach it — a plain, single scrollbar for the whole pane doesn't have either problem). */
+.scratch-sticky-top { position: sticky; top: 0; z-index: 1; background: var(--panel); display: flex; flex-direction: column; gap: 10px; }
+/* Floating only: the panel has its own 10px padding all round (unlike docked, where .dpane has none),
+   so the sticky header needs the same ancestor-padding compensation .deck-top uses elsewhere in this
+   file — bleed out to the panel's real top/left/right edges, then pad itself back in by the same
+   amount, so it sticks flush with rounded corners instead of leaving a 10px gap above it when stuck. */
+.dpane[data-pane='scratch'].floating .scratch-sticky-top { margin: -10px -10px 0; padding: 10px 10px 0; border-radius: var(--radius) var(--radius) 0 0; }
+.scratch-resize-handle { display: none; position: absolute; right: 0; bottom: 0; width: 18px; height: 18px; cursor: nwse-resize; touch-action: none; }
+.scratch-resize-handle::before {
+  content: ''; position: absolute; right: 4px; bottom: 4px; width: 8px; height: 8px;
+  border-right: 2px solid var(--muted); border-bottom: 2px solid var(--muted); opacity: 0.6;
+}
+.dpane[data-pane='scratch'].floating .scratch-resize-handle { display: block; }
+@media (max-width: 900px) {
+  /* A free-floating, draggable window doesn't fit a phone-width single column: dock it there instead. */
+  .dpane[data-pane='scratch'].floating { position: static; width: auto; height: auto; inset: auto; box-shadow: none; }
+  .dpane[data-pane='scratch'].floating .scratch-float-bar,
+  .dpane[data-pane='scratch'].floating .scratch-resize-handle { display: none; }
+  /* Same reasoning as the docked cap above, and needed here too: below the breakpoint .stage no longer
+     scrolls on its own (.layout stacks into one column instead — see the min-width:901px block), so
+     without a cap here a tall Scratchpad would still push the tracks a long way down the single page. */
+  .dpane[data-pane='scratch'] { max-height: 420px; overflow-y: auto; overflow-x: hidden; }
+}
+#lyricsSearchLink { display: none; margin-left: auto; text-decoration: none; }
+#scratchTabLyrics[aria-pressed='true'] ~ #lyricsSearchLink { display: inline-flex; }
+#tabExtendBtn { display: none; margin-left: auto; }
+#scratchTabGuitar[aria-pressed='true'] ~ #tabExtendBtn, #scratchTabBass[aria-pressed='true'] ~ #tabExtendBtn, #scratchTabDrums[aria-pressed='true'] ~ #tabExtendBtn { display: inline-flex; }
+.tool.live .live-grp { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.tool.native-audio { margin-top: 6px; }
+.tool.native-audio .na-dd { width: 190px; flex: none; }
+.tool.native-audio .na-dd .dd-btn { height: var(--h); padding: 0 8px; font-size: 12px; }
+/* The open list may be wider than the button so long device names are readable. */
+.tool.native-audio .na-dd .dd-list { right: auto; width: max-content; min-width: 100%; max-width: 360px; }
+.tool.native-audio .na-route { flex-basis: 100%; }
+.tool.native-audio .na-stats { flex-basis: 100%; }
+.tool.native-audio .na-stats.bad { color: var(--bad); }
+.tool.live .live-rec { flex-wrap: nowrap; }
+.tool.live .live-grp:not(:has(> :not([hidden]))) { display: none; }
+.live-meter { width: 70px; height: 8px; border-radius: 4px; background: var(--panel); overflow: hidden; }
+.live-meter i { display: block; height: 100%; width: 0; background: var(--ok); }
+.tool .snap { margin-left: auto; }
+.tool select { width: auto; padding: 3px 6px; font-size: 12px; }
+.trainer-cfg { font-size: 12px; color: var(--muted); display: inline-flex; align-items: center; gap: 3px; flex-wrap: wrap; }
+.trainer-cfg input { width: 58px; padding: 2px 4px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel); font-size: 12px; }
+.bpm { font-weight: 600; font-size: 13px; margin-right: 4px; }
+.bpm.key { padding: 2px 10px; border: 0; border-left: 1px solid var(--line); background: transparent; cursor: pointer; text-decoration: underline dotted; text-underline-offset: 3px; }
+.key-panel { flex-direction: column; align-items: stretch; gap: 8px; grid-column: 1 / -1; }
+.kp-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.kp-list { display: flex; gap: 6px; flex-wrap: wrap; }
+.kp-list .eq-chip { --c: var(--accent); }
+.kp-list .eq-chip.cur { background: color-mix(in srgb, var(--accent) 25%, transparent); border-color: var(--accent); }
+.kp-set { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); margin-left: auto; }
+.tool #clickVol { flex: 0 1 110px; min-width: 60px; }
+.no-beats .needs-beats { opacity: 0.45; pointer-events: none; }
+.btn.tap-on { background: var(--accent); color: #fff; }
+.tool label { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+.tool input[type='range'] { flex: 1; min-width: 80px; }
+.tool.loop { grid-column: 1 / -1; }
+
+/* Above 900px (where .layout is two columns — see the other @media(min-width:901px) block for the
+   independent-scroll panes and the sticky .deck-top), the deck's always-visible chrome stays on one
+   line instead of wrapping. This must come after every base rule above that it overrides, since a
+   later same-specificity rule wins regardless of which one is in a media query. Below 900px this
+   is untouched: the original wrapping behaviour, which is what a phone-width single column needs. */
+@media (min-width: 901px) {
+  /* Title truncates with an ellipsis (it's still fully visible via its tooltip — see setTitleText()
+     in deck.ts — and double-click-to-rename still works); the action buttons never move. */
+  .deck-head { flex-wrap: nowrap; }
+  .deck-head > div:first-child { min-width: 0; overflow: hidden; }
+  .deck-head h1 { overflow-wrap: normal; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .deck-head p { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .deck-actions { flex-wrap: nowrap; flex-shrink: 0; }
+
+  /* Everything in the transport row stays fixed size except loopInfo, which truncates instead (see
+     .tool.loop below) — the row's own width never needs to grow past what the buttons need. */
+  .transport-bar { flex-wrap: nowrap; }
+  .transport-bar > *:not(.tool.loop) { flex-shrink: 0; }
+  /* Without an explicit floor, flexbox lets .tool.loop get squeezed by its shrink:0 siblings below
+     what it can actually fit even with #loopInfo at its own min-width, which just makes .tool.loop
+     itself overflow instead of the row growing to fit it (measured floor with Clear visible: ~413px). */
+  .transport-bar > .tool.loop { min-width: 420px; }
+  .tool.loop { flex-wrap: nowrap; grid-column: auto; }
+  /* The one bit of free text in the always-visible controls: shrinks and truncates instead of
+     wrapping or forcing the row wider. Its default text is a full sentence, the widest single item here. */
+  .tool.loop #loopInfo { flex: 1 1 auto; min-width: 40px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tool.loop > *:not(#loopInfo) { flex-shrink: 0; }
+
+  /* Tempo/Pitch/Volume stay in one row (each can shrink a bit before the row would need to grow)
+     instead of wrapping onto extra rows once narrow. Measured floor per slider: 244px. */
+  .tools-sliders { flex-wrap: nowrap; }
+  .tools-sliders > .tool { flex: 1 1 244px; min-width: 0; grid-column: auto; }
+  /* The drawer's own tabs stay one row (see the note by .drawer-tabs's own rule for the one
+     exception); what a tab's pane contains once open is varied and sometimes dense (e.g. Live
+     input), so those keep wrapping like a normal settings panel. */
+  .tool.practice, .tool.beat, .tool.live, .tool.tuner, .tool.scratch-tabs { flex-wrap: wrap; }
+  /* The one exception to "nothing wraps": with Live input showing (its widest case), these 5 tab
+     buttons need ~660px on their own, which would push the app's minimum width past what most
+     screens can show. Letting just this row wrap to a second line if it must is a much smaller
+     trade-off than the one it avoids. */
+  .dtab { flex-shrink: 0; }
+
+  /* +Marker/Chords/Notes never move; the marker chips scroll sideways instead of wrapping once
+     there are enough of them to not fit (there's no fixed limit on how many a song can have). */
+  .markers-bar { flex-wrap: nowrap; }
+  .markers-bar > .markers { flex: 1 1 auto; min-width: 40px; overflow-x: auto; flex-wrap: nowrap; }
+  .markers-bar > .x-toggles { flex-shrink: 0; }
+}
+
+.lanes { display: flex; flex-direction: column; gap: 6px; }
+.lane { display: grid; grid-template-columns: 236px 1fr; gap: 10px; align-items: stretch; }
+.lane.selected .lane-ctl { outline: 2px solid var(--c); outline-offset: -1px; }
+.lane.selected .wave { outline: 2px solid var(--c); outline-offset: -2px; }
+.lane.recording .lane-ctl { animation: rec-pulse 1.4s ease-in-out infinite; }
+.lane.recording .wave { outline: 2px solid var(--c); outline-offset: -2px; }
+.take-strip { grid-column: 1 / -1; display: flex; flex-direction: column; gap: 4px; }
+.take-row { display: flex; align-items: center; gap: 4px; }
+.take-block { display: flex; flex-direction: column; gap: 4px; }
+.take-nudge { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; }
+.take-nudge-ms { margin: 0 4px; }
+.take-chip {
+  flex: 1; text-align: left; padding: 4px 8px; border-radius: 6px; border: 1px solid var(--line);
+  background: var(--panel); color: var(--muted); font-size: 12px; cursor: pointer;
+}
+.take-chip:hover { border-color: var(--c); color: var(--text); }
+.take-del { background: none; border: 0; color: var(--muted); cursor: pointer; padding: 2px 7px; border-radius: 4px; font-size: 14px; line-height: 1; }
+.take-del:hover { color: var(--bad); background: var(--panel); }
+.take-badge { font-weight: 400; }
+.take-note { flex: 1; text-align: left; padding: 4px 8px; border-radius: 6px; border: 1px dashed var(--line); background: none; color: var(--muted); font-size: 11px; font-style: italic; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.take-note:hover { border-color: var(--c); color: var(--text); }
+.take-note-edit { flex: 1; min-width: 0; padding: 4px 8px; border-radius: 6px; border: 1px solid var(--accent); background: var(--panel); color: var(--text); font-size: 11px; }
+.take-chip.current { flex: 0 0 auto; padding: 4px 8px; border-radius: 6px; border: 1px solid var(--c); color: var(--c); font-size: 12px; font-weight: 600; }
+.lane-ctl { display: grid; grid-template-columns: auto auto auto auto auto 1fr; align-content: start; gap: 6px; align-items: center; background: var(--panel-2); border-radius: 9px; padding: 6px 8px; border-left: 3px solid var(--c); }
+.lane-ctl input[type='range'] { accent-color: var(--c); }
+.lane-ctl .name { font-weight: 600; text-transform: capitalize; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; grid-column: 1 / -1; border: 0; background: transparent; padding: 0; text-align: left; cursor: text; color: inherit; font-size: inherit; }
+.lane-ctl .name-edit { grid-column: 1 / -1; width: 100%; border: 0; outline: 1px solid var(--accent); background: var(--panel); border-radius: 4px; font-size: 13px; font-weight: 600; padding: 2px 6px; }
+.lane-ctl .mini.vol { grid-column: 6; grid-template-columns: 1fr; padding-left: 4px; }
+.lane-ctl .mini.vol span { display: none; }
+.lane-ctl .mini { grid-column: 1 / -1; display: grid; grid-template-columns: 26px 1fr 30px; align-items: center; gap: 6px; font-size: 11px; color: var(--muted); }
+.lane-ctl .mini output { font-size: 11px; text-align: right; }
+/* Pan adds a full extra row to .lane-ctl; grow the waveform to match so the two columns stay level. */
+.lanes.show-pan .lane:not(.x-lane) .wave { height: 88px; }
+.ms { width: 26px; height: 24px; border-radius: 6px; border: 1px solid var(--line); background: transparent; cursor: pointer; font-size: 11px; font-weight: 700; }
+.ms.m[aria-pressed='true'] { background: var(--warn); color: #111; border-color: var(--warn); }
+.ms.s[aria-pressed='true'] { background: var(--ok); color: #111; border-color: var(--ok); }
+.ms.eq { width: auto; padding: 0 6px; }
+.ms.eq.on { background: var(--c, var(--accent)); color: #111; border-color: var(--c, var(--accent)); }
+.ms.eq[aria-pressed='true'], .lane.eq-open .ms.eq { outline: 2px solid var(--accent); outline-offset: 1px; }
+.eq-panel { grid-column: 1 / -1; background: var(--panel-2); border-radius: 9px; padding: 10px 12px; border-left: 3px solid var(--c); display: flex; flex-direction: column; gap: 10px; }
+.eq-presets { display: flex; flex-wrap: wrap; gap: 6px; }
+.eq-chip { padding: 3px 10px; border-radius: 99px; border: 1px solid var(--line); background: transparent; cursor: pointer; font-size: 12px; }
+.eq-chip[aria-pressed='true'] { background: color-mix(in srgb, var(--c) 25%, transparent); border-color: var(--c); }
+.eq-body { display: grid; grid-template-columns: minmax(200px, 1fr) minmax(260px, 1.2fr); gap: 14px; align-items: center; }
+.eq-graph { position: relative; height: 120px; background: var(--panel); border-radius: 8px; color: var(--muted); }
+.eq-curve { position: absolute; inset: 0; width: 100%; height: 100%; }
+.eq-sliders { display: flex; flex-direction: column; gap: 4px; }
+.eq-row { display: grid; grid-template-columns: 78px 1fr 62px; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+.eq-row output { font-size: 12px; text-align: right; }
+@media (max-width: 700px) { .eq-body { grid-template-columns: 1fr; } }
+.dl { width: 26px; height: 24px; border-radius: 6px; border: 1px solid var(--line); background: transparent; cursor: pointer; display: grid; place-items: center; }
+.dl svg { width: 14px; height: 14px; }
+/* height (not min-height): a default the resize handle can freely override in either direction. */
+/* user-select off: a drag across a waveform (scrubbing, or picking a section) otherwise also starts a text selection from the nearest text, which carries on up over whatever the pointer crosses — the tab window, say — highlighting it blue. */
+.lane .wave { position: relative; height: 58px; background: var(--panel-2); border-radius: 9px; overflow: hidden; cursor: pointer; -webkit-user-select: none; user-select: none; }
+.lane.off .wave { opacity: 0.35; }
+.lane-resize { grid-column: 1 / -1; height: 12px; cursor: ns-resize; touch-action: none; display: flex; align-items: center; justify-content: center; }
+.lane-resize::before { content: ''; width: 40px; height: 4px; border-radius: 2px; background: var(--muted); opacity: 0.45; transition: background 0.15s, opacity 0.15s; }
+.lane-resize:hover::before { background: var(--accent); opacity: 1; }
+@media (max-width: 700px) {
+  .lane { grid-template-columns: 1fr; gap: 4px; }
+  .lane .wave { height: 40px; }
+}
+.shortcuts { margin: 0; }
+.shortcuts-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.ov-col { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+#viewScroll { height: 14px; }
+#viewScroll[hidden] { display: block !important; visibility: hidden; } /* keep its space so nothing jumps when zooming */
+.markers-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: -6px; }
+.zoom { display: inline-flex; gap: 2px; }
+.overview .zoom { position: absolute; right: 6px; bottom: 6px; z-index: 2; background: color-mix(in srgb, var(--panel) 75%, transparent); border-radius: 8px; padding: 2px; }
+.markers { display: flex; flex-wrap: wrap; gap: 6px; flex: 1; min-width: 0; }
+.marker-chip { display: inline-flex; align-items: center; border: 1px solid var(--line); border-radius: 99px; background: var(--panel-2); font-size: 12px; overflow: hidden; }
+.marker-chip.here { border-color: var(--accent); }
+.marker-chip button { border: 0; background: transparent; cursor: pointer; padding: 3px 8px; font-size: 12px; }
+.marker-chip .mk-go { font-weight: 600; }
+.marker-chip .mk-edit { width: 110px; border: 0; outline: 1px solid var(--accent); background: var(--panel); font-size: 12px; padding: 3px 8px; }
+.marker-chip .mk-loop, .marker-chip .mk-del, .marker-chip .mk-ren { padding: 3px 6px; color: var(--muted); }
+.marker-chip .mk-loop:hover, .marker-chip .mk-del:hover, .marker-chip .mk-ren:hover { color: var(--text); }
+@media (hover: none) { .shortcuts { display: none; } }
+
+/* ---------- transcription lanes (chords, notes) ---------- */
+.x-toggles { display: inline-flex; gap: 4px; }
+.xlanes:not(:has(> :not([hidden]))) { display: none; }
+.x-lane .lane-ctl { --c: var(--accent); align-content: center; }
+.x-ctl .name { grid-column: auto; }
+.chord-lane .lane-ctl { grid-template-columns: 1fr auto auto; row-gap: 2px; }
+.chord-lane .wave { min-height: 34px; }
+.chord-lane .x-now, .chord-lane .x-status { grid-column: 1 / -1; grid-row: 2; min-height: 18px; }
+.x-now { font-weight: 700; font-size: 14px; color: var(--accent); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.x-ctl .btn.tiny { height: 24px; padding: 0 8px; font-size: 12px; }
+.x-lane .notes-ctl { grid-template-columns: 1fr 52px; padding: 0 0 0 8px; align-items: stretch; align-content: stretch; }
+.notes-ctl .x-col { padding: 6px 0; }
+.x-col { display: flex; flex-direction: column; gap: 6px; justify-content: center; min-width: 0; }
+.x-col select { height: 28px; padding: 0 6px; font-size: 12px; min-width: 0; }
+.x-row { display: flex; flex-wrap: wrap; gap: 4px; }
+.x-keys { position: relative; width: 52px; border-radius: 0 9px 9px 0; overflow: hidden; cursor: pointer; }
+.notes-lane .wave { height: 360px; background: #0f0f17; cursor: crosshair; }
+.x-status { min-height: 1em; }
+.chord-edit { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-left: 246px; background: var(--panel-2); border-radius: 9px; padding: 8px 10px; border-left: 3px solid #f59e0b; }
+.chord-edit .ce-name { font-weight: 700; font-size: 15px; }
+.chord-edit .ce-alts, .chord-edit .ce-set { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+.chord-edit select { width: auto; height: 28px; padding: 0 6px; font-size: 12px; }
+@media (max-width: 700px) {
+  .x-keys { display: none; }
+  .x-lane .notes-ctl { grid-template-columns: 1fr; padding: 0 8px; }
+  .notes-lane .wave { height: 220px; }
+  .chord-edit { margin-left: 0; }
+}
+
+/* One control height across the player's tool rows, so labels, buttons, dropdowns and boxes line up. */
+.tool, .markers-bar { --h: 30px; }
+.tool .btn, .markers-bar .btn, .tool select, .tool input[type='number'], .marker-chip, .bpm.key {
+  height: var(--h);
+  box-sizing: border-box;
+}
+.tool .btn, .markers-bar .btn { padding: 0 12px; font-size: 13px; line-height: 1; }
+.tool select { padding: 0 8px; }
+.tool input[type='number'] { padding: 0 6px; }
+.tool label.takes { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); white-space: nowrap; }
+.tool label.takes input[type='number'] { width: 48px; }
+.tool .btn.toggle#loopBtn { font-size: 13px; }
+.trainer-cfg { gap: 4px; }
+.bpm { display: inline-flex; align-items: center; line-height: 1; }
+.marker-chip button, .marker-chip .mk-edit { height: 100%; display: inline-flex; align-items: center; }
+.zoom .btn { width: 32px; padding: 0; }
+.zoom .btn#zoomFit { width: auto; padding: 0 10px; }
+@media (hover: none) { .shortcuts { display: none; } }
+
+/* ---------- dialog & toasts ---------- */
+dialog {
+  width: min(640px, calc(100vw - 32px)); max-height: calc(100vh - 64px); border: 1px solid var(--line); border-radius: 14px;
+  background: var(--panel); color: var(--text); padding: 18px; box-shadow: var(--shadow); overflow-y: auto;
+}
+dialog::backdrop { background: rgba(0, 0, 0, 0.5); }
+.dlg-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
+.dlg-foot { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-top: 14px; flex-wrap: wrap; }
+.m-group { border-top: 1px solid var(--line); padding: 10px 0; }
+.m-group-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 6px; }
+.m-group h3 { margin: 0; font-size: 14px; }
+.m-browse { font-size: 12px; color: var(--accent-2); text-decoration: none; white-space: nowrap; }
+
+/* ---------- about ---------- */
+.about-hero { display: flex; align-items: center; gap: 12px; margin: 6px 0 10px; }
+.about-name { font-size: 20px; font-weight: 700; }
+.about-name span { font-size: 13px; font-weight: 500; color: var(--muted); margin-left: 4px; }
+.about-links { display: flex; flex-wrap: wrap; gap: 4px 16px; }
+.about-links a, .about-list a { color: var(--accent-2); }
+/* ---------- setlist ---------- */
+#setlistCard .card-head .dd { max-width: 60%; }
+.sl-bar { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.sl-list { margin-bottom: 6px; }
+.sl-ctl { grid-row: 1 / span 2; grid-column: 2; display: flex; gap: 2px; align-items: center; }
+.sl-mv { background: none; border: 0; color: var(--muted); cursor: pointer; padding: 4px 6px; border-radius: 6px; font-size: 14px; line-height: 1; }
+.sl-mv:hover:not(:disabled) { color: var(--text); background: var(--line); }
+.sl-mv:disabled { opacity: 0.3; cursor: default; }
+.sl-transport { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+.sl-buttons, .sl-auto { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.sl-row .t-sub { color: var(--muted); }
+#slDelete.confirm { color: var(--bad); font-weight: 600; }
+
+/* ---------- synced lyrics ---------- */
+.lyrics-nudge { display: inline-flex; align-items: center; gap: 4px; }
+.lyrics-follow { max-height: 260px; overflow-y: auto; background: var(--panel-2); border-radius: 10px; padding: 14px 10px; margin-top: 8px; text-align: center; scroll-behavior: smooth; }
+.lyric-line { padding: 4px 10px; color: var(--muted); cursor: pointer; font-size: 16px; line-height: 1.4; border-radius: 6px; min-height: 1.4em; transition: color 0.15s, font-size 0.15s; }
+.lyric-line:hover { background: color-mix(in srgb, var(--text) 8%, transparent); }
+.lyrics-follow.with-chords { text-align: left; }
+.with-chords .lyric-line { line-height: 1.2; padding: 6px 10px; }
+.lyric-line .lc-seg { display: inline-flex; flex-direction: column; vertical-align: bottom; white-space: pre; }
+.lyric-line .lc-ch { font-size: 13px; font-weight: 700; color: #8b7cf6; min-height: 1.3em; padding-right: 8px; border-radius: 4px; line-height: 1.3; }
+.lyric-line .lc-ch.now { background: #8b7cf6; color: #fff; }
+.lyric-line.past { opacity: 0.55; }
+.lyric-line.current { color: var(--text); font-weight: 700; font-size: 20px; }
+
+/* ---------- tab+ (engraved tab follow-along, and the separate full staff) ----------
+   The engraved tab (#tabStrip: a tab stave with fret numbers, rhythm row above it — see
+   ui/staff.ts's drawTabScore) and the full notation staff (#tabStaff: drawStaff) are drawn the
+   same way (both VexFlow SVGs sliding past a fixed point) and so share one set of view/track/
+   cursor/notebox classes below, applied to both; only the outer wrapper classes (.tab-strip,
+   .tab-staff) differ, for the height-sizing rule just under this comment. */
+.tab-timeline { position: relative; display: flex; flex-direction: column; }
+/* Neither box is given flex:1 here, so each takes exactly its own natural content height (the default
+   for a flex item) — the Scratchpad's own scrollbar (see .dpane[data-pane='scratch']) is what handles
+   there not being enough room for both, rather than the two fighting over a fixed amount of space. */
+/* When both boxes show, remove the seam between them so the shared cursor line reads as one strip. */
+.tab-timeline.joined #tabStrip { margin-bottom: -1px; border-bottom-left-radius: 0; border-bottom-right-radius: 0; }
+.tab-timeline.joined #tabStaff { border-top-left-radius: 0; border-top-right-radius: 0; }
+/* Each box's own cursor line goes invisible when joined: the single shared bar below (positioned
+   and sized to match the engraved tab's own cursor exactly, in deck.ts) replaces both, rather than
+   sitting alongside a thin line that — before this — didn't even line up with it. opacity, not
+   display:none or hidden: deck.ts measures the tab's own cursor's rendered position to place the
+   shared bar, which needs it to stay laid out (display:none zeroes getBoundingClientRect). */
+.tab-timeline.joined .tab-staff-cursor { opacity: 0; }
+.tab-timeline-cursor { position: absolute; top: 0; bottom: 0; background: var(--accent); opacity: 0.35; border-radius: 2px; pointer-events: none; }
+/* x stays clipped (both boxes slide their content horizontally via transform, past the fixed
+   cursor). y is auto rather than visible mostly because a browser won't actually let it be visible
+   here — an axis left visible while the other isn't gets silently forced to auto — but it's also a
+   second line of defence behind the Scratchpad's own scrollbar (see .dpane[data-pane='scratch']):
+   each box normally renders at its own full natural height, this only matters if something else
+   ever constrains it smaller than that. */
+.scratch-area.tab-strip, .scratch-area.tab-staff { overflow-x: hidden; overflow-y: auto; min-height: 0; padding: 2px 12px; color: var(--text); }
+.scratch-area.tab-strip[hidden], .scratch-area.tab-staff[hidden] { display: none; }
+.tab-symbols { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 18px; margin: 0 0 8px; padding: 8px 12px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel-2); font-size: 12px; line-height: 1.5; color: var(--muted); }
+.tab-symbols[hidden] { display: none; }
+.tab-symbols b { color: var(--text); font-weight: 600; }
+.tab-symbols p { margin: 2px 0 6px; }
+.tab-symbols code { font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: var(--text); background: var(--panel); padding: 0 3px; border-radius: 3px; }
+@media (max-width: 720px) { .tab-symbols { grid-template-columns: 1fr; } }
+/* user-select off for the whole view, not just while a drag is under way: a drag starts selecting the
+   surrounding text (and highlighting it blue) from its very first pixel, before it's known to be one. */
+/* the click target over a bar number in Follow along (loop that bar), only visible when hovered */
+.tab-barnum { cursor: pointer; }
+.tab-barnum:hover { fill: var(--accent); fill-opacity: 0.25; }
+/* ear training: the tab's content is hidden while it plays (the cursor and the right/wrong box stay) */
+.tab-timeline.ear-hidden .tab-staff-track { visibility: hidden; }
+.tab-timeline.ear-hidden .tab-staff-view::after { content: 'Ear training: tab hidden while playing, pause to look'; position: absolute; left: 14px; top: 50%; transform: translateY(-50%); max-width: 28%; font-size: 14px; line-height: 1.4; color: #555; pointer-events: none; }
+.tab-staff-view { position: relative; overflow: hidden; touch-action: pan-y; -webkit-user-select: none; user-select: none; }
+.tab-staff-view.panning { cursor: grabbing; }
+.tab-staff-track { will-change: transform; width: max-content; }
+.tab-staff-note { color: var(--muted); font-size: 13px; padding: 8px 0; }
+/* The fixed spot each box's content slides past — the engraved tab's and the staff's line up (see
+   the .joined rule above), since both use this same left:40% and deck.ts lines the staff's content
+   up with wherever the tab's cursor actually renders, not an independent 40%-of-its-own-width guess. */
+/* 8px and translucent: a thin line was easy to lose, and a solid thick one would hide the fret digit under it. The music's own centre (a fret digit's, and its stem's) is what sits at exactly 40% (deck.ts holds staffX() there, which is a note's centre), so the bar is pulled back by half its width to be centred on that rather than start at it. */
+.tab-staff-cursor { position: absolute; top: 0; bottom: 0; left: 40%; width: 8px; margin-left: -4px; background: var(--accent); opacity: 0.5; border-radius: 4px; pointer-events: none; }
+/* The actual note (or fret) sounding right now, behind the moving line rather than instead of it —
+   the line still says "this instant", the box says "this note" (useful once several are close together). */
+.tab-staff-notebox { position: absolute; top: 0; background: var(--accent); opacity: 0.18; border-radius: 4px; pointer-events: none; }
+/* Playing trainer: right/wrong on top of the note box above, same idea as the Tuner's needle colour
+   swap (.in-tune) — a class toggled each tick from live mic pitch, not a separate element. */
+.tab-staff-notebox.trainer-hit { background: var(--ok); opacity: 0.35; }
+.tab-staff-notebox.trainer-miss { background: var(--bad); opacity: 0.35; }
+/* The note currently selected for rhythm editing (click it, then press w/h/q/e/s) — an outline, not a
+   fill, so it still reads clearly if it ever lands on the same note as the fill-based box above. */
+.tab-staff-editbox { background: none; border: 2px solid var(--accent-2); opacity: 1; }
+.tab-tap-sel { display: inline-flex; align-items: center; gap: 6px; }
+
+.about-support .btn { display: inline-block; text-decoration: none; margin-top: 4px; }
+.about-update { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; margin: 0 0 8px; }
+.about-update a { color: var(--accent-2); }
+#diagText { width: 100%; box-sizing: border-box; margin-top: 6px; font: 11px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--panel-2); color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 8px; resize: vertical; user-select: text; }
+.about-list { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 5px; }
+.about-lic details { margin: 4px 0; }
+.about-lic summary { cursor: pointer; padding: 3px 0; }
+.about-lic pre { white-space: pre-wrap; font-size: 11px; line-height: 1.45; max-height: 220px; overflow: auto; background: var(--panel-2); border-radius: 8px; padding: 10px; margin: 6px 0; user-select: text; }
+
+/* ---------- keyboard shortcuts help ---------- */
+.kb-list { display: flex; flex-direction: column; gap: 8px; }
+.kb-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.kb-row span { color: var(--muted); font-size: 13px; margin-left: 4px; }
+kbd {
+  display: inline-flex; align-items: center; justify-content: center; min-width: 22px; height: 22px; padding: 0 6px;
+  border-radius: 6px; border: 1px solid var(--line); background: var(--panel-2); box-shadow: 0 1px 0 var(--line);
+  font: 12px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: var(--text);
+}
+
+/* ---------- "From YouTube" dialog ---------- */
+.yt-search { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.yt-search input[type='text'] {
+  flex: 1 1 160px; padding: 7px 10px; border-radius: 8px; border: 1px solid var(--line);
+  background: var(--panel-2); color: inherit; font: inherit;
+}
+.yt-results { display: flex; flex-direction: column; gap: 6px; max-height: 50vh; overflow-y: auto; }
+.yt-result {
+  position: relative; display: flex; align-items: center; gap: 10px; overflow: hidden;
+  text-align: left; padding: 6px; border-radius: 9px; border: 1px solid transparent;
+  background: var(--panel-2); cursor: pointer; font: inherit; color: inherit;
+}
+.yt-result:hover { border-color: var(--line); }
+.yt-result:disabled { cursor: default; opacity: 0.7; }
+.yt-result img, .yt-thumb-blank { width: 64px; height: 36px; border-radius: 5px; object-fit: cover; background: var(--panel); flex: none; }
+.yt-meta { min-width: 0; }
+.yt-title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.m-browse:hover { text-decoration: underline; }
+.m-file { display: grid; grid-template-columns: 1fr auto auto auto; gap: 8px; align-items: center; padding: 4px 0; font-size: 13px; }
+.m-file code { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.m-file .st { font-size: 12px; color: var(--muted); }
+.m-file .st.have { color: var(--ok); }
+.toasts { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); display: flex; flex-direction: column; gap: 8px; z-index: 50; width: min(440px, calc(100vw - 32px)); }
+.toast { background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; box-shadow: var(--shadow); animation: pop 0.2s ease-out; }
+.toast.bad { border-color: var(--bad); }
+@keyframes pop { from { opacity: 0; transform: translateY(8px); } }
+
+/* Scratchpad parts (Guitar / Bass / Drums): the link to a track */
+.part-link { display: inline-flex; align-items: center; gap: 6px; }
+.part-link[hidden] { display: none; }
+.part-link .dd { width: 150px; }
+.part-link .dd-btn { height: var(--h); padding: 0 8px; font-size: 12px; }
+.part-link .dd-label, .part-link .dd-opt { text-transform: capitalize; } /* track names are stored in lower case ("bass") and shown capitalised, as on the track itself */
+.part-link .dd-list { right: auto; width: max-content; min-width: 100%; max-width: 280px; }
+.part-rename { height: var(--h); width: 90px; padding: 0 8px; border-radius: 8px; border: 1px solid var(--accent); background: var(--panel); color: var(--text); font-size: 12px; }
+/* The track the open tab is for is outlined in the track list; its own Tab button jumps to the tab. */
+.lane.part-linked .lane-ctl { outline: 2px dashed var(--accent); outline-offset: -2px; }
+.lane-ctl .lane-tab[hidden] { display: none; }
+.backup-note { margin: 4px 2px 0; }
+.backup-note.stale { color: var(--warn); }
+
+/* Keyboard users can see where they are: every control gets a clear ring when it is reached with the keyboard (not when clicked). */
+button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, summary:focus-visible, [tabindex]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* The scrolling chord timeline */
+.chord-strip-lane .lane-ctl { display: flex; flex-wrap: wrap; row-gap: 4px; align-content: flex-start; }
+.chord-strip-lane .lane-ctl .name { flex-basis: 100%; }
+.chord-strip-lane .wave { height: 104px; cursor: pointer; }
+.chord-strip-lane .lane-ctl select { max-width: 100%; }
+.chord-shapes { display: flex; flex-wrap: wrap; gap: 10px 22px; padding: 6px 12px 8px; align-items: flex-start; }
+.chord-shapes[hidden] { display: none; }
+.chord-shape { display: flex; flex-direction: column; gap: 3px; min-width: 120px; }
+.chord-shape.now .cs-name { color: #8b7cf6; }
+.cs-head { display: flex; align-items: baseline; gap: 8px; }
+.cs-label { font-size: 11px; opacity: .6; text-transform: uppercase; letter-spacing: .04em; }
+.cs-name { font-weight: 700; font-size: 18px; }
+.cs-extra { font-size: 11px; opacity: .6; }
+.cs-capo { align-self: center; max-width: 220px; font-size: 12px; opacity: .7; }
+.cs-none { font-size: 12px; opacity: .5; padding: 14px 0; }
+.chord-svg { display: block; }
+
+/* Native audio: easy to find while it is experimental and off by default */
+.native-tip { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; background: color-mix(in srgb, var(--accent) 12%, transparent); border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent); border-radius: 9px; padding: 8px 10px; margin-bottom: 8px; font-size: 13px; }
+.native-tip[hidden] { display: none; }
+.native-tip span { flex: 1 1 320px; }
+.tool.native-audio.attention { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 9px; animation: na-attn 1s ease-in-out 3; }
+@keyframes na-attn { 50% { outline-color: transparent; } }
+
+/* Practice view: everyday controls first, library and fine controls on demand. */
+.gp-panel, #practiceLibraryToggle { display: none; }
+.gp-mode #deck > :not(.gp-panel), .gp-mode .chips, .gp-mode .brand small { display: none; }
+.gp-mode #practiceLibraryToggle { display: inline-flex; }
+.gp-mode .layout { grid-template-columns: minmax(0, 1fr); max-width: 1080px; width: 100%; margin: 0 auto; padding: 28px; }
+.gp-mode .side { display: none; }
+.gp-mode.gp-library-open .layout { grid-template-columns: 330px minmax(0, 1fr); max-width: 1440px; gap: 24px; }
+.gp-mode.gp-library-open .side { display: block; padding: 0 8px 0 0; }
+.gp-mode .stage { padding: 0; }
+.gp-mode .top { justify-content: space-between; }
+.gp-mode #deck { padding: 0; }
+.gp-mode .gp-panel { display: flex; flex-direction: column; gap: 26px; padding: 32px; }
+.gp-heading, .gp-row, .gp-presets { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.gp-heading { justify-content: space-between; }
+.gp-heading h1 { overflow-wrap: anywhere; font-size: 26px; line-height: 1.3; }
+.gp-heading output { color: var(--muted); font-variant-numeric: tabular-nums; }
+.gp-transport { display: flex; align-items: center; gap: 12px; }
+.gp-transport > input { flex: 1; min-width: 50px; }
+.gp-panel button, #practiceMode, #practiceLibraryToggle, .gp-menu summary, .gp-disclosure summary, .gp-welcome-info summary { min-height: 44px; min-width: 44px; touch-action: manipulation; }
+.gp-panel button:focus-visible, .gp-panel input:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.gp-play { min-width: 116px !important; min-height: 56px !important; font-size: 16px; }
+.gp-panel .primary { color: #19130b; }
+.gp-panel input[type='range'] { display: block; width: 100%; height: 44px; margin: 0; touch-action: pan-y; }
+.gp-label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 10px; }
+.gp-presets { gap: 8px; }
+.gp-presets button { flex: 1; min-height: 50px; }
+.gp-panel button[aria-pressed='true'] { background: var(--accent); border-color: var(--accent); color: #19130b; }
+.gp-tools { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }
+.gp-lanes { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.gp-card { border: 1px solid var(--line); border-radius: 14px; padding: 16px; background: var(--panel-2); display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.gp-card .gp-row { justify-content: space-between; gap: 8px; }
+.gp-card output { color: var(--accent); font-variant-numeric: tabular-nums; }
+.gp-card .gp-row > .btn { padding: 6px 10px; }
+.gp-secondary { display: grid; grid-template-columns: 1fr 1fr; align-items: start; gap: 20px; }
+.gp-click { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; min-height: 44px; }
+.gp-click .muted { font-size: 12px; }
+.gp-disclosure { min-width: 0; }
+.gp-disclosure summary, .gp-welcome-info summary { cursor: pointer; padding: 12px 0; color: var(--muted); }
+.gp-mixer { border-top: 1px solid var(--line); }
+.gp-detail-body { display: flex; flex-direction: column; gap: 16px; padding: 12px 0; }
+.gp-lane.silent strong::after { content: ' · OFF'; font-size: 11px; color: var(--muted); }
+.gp-beats { display: flex; gap: 5px; }
+.gp-beats span { width: 30px; text-align: center; padding: 4px; border-radius: 5px; border: 1px solid var(--line); }
+.gp-beats .active { background: var(--accent); color: #19130b; }
+.gp-status { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+.gp-menu { position: relative; }
+.gp-menu > summary { cursor: pointer; padding: 12px; list-style: none; border-radius: 8px; color: var(--muted); }
+.gp-menu > summary::-webkit-details-marker { display: none; }
+.gp-menu-body { position: absolute; z-index: 40; right: 0; top: 100%; width: 210px; padding: 12px; display: flex; flex-wrap: wrap; gap: 8px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); box-shadow: 0 12px 40px #0006; }
+.gp-menu-body > button { min-height: 44px; }
+.gp-mode .multi { flex-wrap: wrap; }
+.gp-mode .side-tabs .stab { min-height: 44px; }
+.gp-mode #welcome:not([hidden]) { display: block; padding: 64px 40px; }
+.gp-mode .welcome .lead { font-size: 17px; margin: 16px 0 28px; }
+.gp-welcome-info { margin-top: 32px; font-size: 13px; }
+.gp-welcome-info .can-do { display: block; }
+@media (max-width: 1100px) {
+  .gp-mode .layout { padding: 20px; }
+  .gp-mode .gp-panel { padding: 24px; gap: 20px; }
+  .gp-mode.gp-library-open .layout { grid-template-columns: 280px minmax(0, 1fr); }
+  .gp-library-open .gp-tools, .gp-library-open .gp-secondary { grid-template-columns: 1fr; }
+}
+@media (max-width: 900px) {
+  .gp-mode.gp-library-open .layout { grid-template-columns: 1fr; }
+  .gp-mode.gp-library-open .side { grid-row: 1; max-height: 60vh; overflow: auto; }
+  .gp-mode .stage { order: initial; }
+  .gp-lanes { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 600px) {
+  .gp-mode .layout { padding: 12px; }
+  .gp-mode .gp-panel { padding: 18px; gap: 20px; }
+  .gp-heading h1 { font-size: 22px; }
+  .gp-mode .top { gap: 8px; padding: 12px; }
+  .gp-mode .brand { font-size: 14px; }
+  .gp-tools, .gp-secondary, .gp-lanes { grid-template-columns: 1fr; }
+  .gp-transport { flex-wrap: wrap; }
+  .gp-transport > input { order: 1; flex-basis: 100%; }
+  .gp-presets { gap: 4px; }
+  .gp-presets button { padding: 8px; font-size: 12px; }
+  .gp-mode #welcome:not([hidden]) { padding: 32px 20px; }
+}
+
+/* DAW arrangement: one horizontal time axis shared by all stem tracks. */
+.gp-mode .layout { max-width: 1500px; padding: 14px 20px; }
+.gp-mode .gp-panel { gap: 12px; padding: 16px; }
+.gp-heading h1 { font-size: 20px; }
+.gp-transport { flex-wrap: wrap; }
+.gp-play { min-height: 44px !important; }
+.gp-speed-control { display: flex; align-items: center; gap: 12px; margin-left: auto; }
+.gp-speed-control span { white-space: nowrap; }
+.gp-panel .gp-speed-control input { width: 120px; }
+.gp-pitch-control { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 12px; }
+.gp-panel input[type=number] { width: 80px; min-height: 44px; background: var(--panel-2); color: var(--text); border: 1px solid var(--line); border-radius: 7px; padding: 8px; font-size: 16px; }
+.gp-command-row { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
+.gp-command-row .gp-presets { flex: 1; }
+.gp-presets button { min-height: 44px; flex: initial; padding: 8px 18px; }
+.gp-command-row > .muted { font-size: 12px; }
+.gp-arrangement { --track-header: 200px; min-width: 0; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.gp-timeline-toolbar { display: flex; align-items: center; gap: 6px; padding: 0 8px; background: var(--panel-2); }
+.gp-timeline-toolbar .muted { margin-right: auto; font-size: 11px; }
+.gp-timeline-toolbar .btn { border: 0; background: transparent; padding: 4px 10px; }
+.gp-track-area { position: relative; }
+.gp-ruler-row, .gp-lane { display: grid; grid-template-columns: var(--track-header) minmax(0, 1fr); }
+.gp-ruler-row { background: var(--panel-2); border-bottom: 1px solid var(--line); }
+.gp-ruler-row > span { color: var(--muted); font-size: 10px; letter-spacing: .16em; padding: 10px 12px; }
+.gp-ruler { width: 100%; height: 32px; }
+.gp-lane { border-bottom: 1px solid var(--line); background: var(--panel); }
+.gp-lane:last-child { border-bottom: 0; }
+.gp-track-header { height: 68px; padding: 4px 10px; border-left: 3px solid var(--track-color); border-right: 1px solid var(--line); background: var(--panel-2); }
+.gp-track-header strong { font-size: 12px; display: block; height: 16px; }
+.gp-track-mix { display: flex; gap: 3px; align-items: center; }
+.gp-track-mix .gp-ms { padding: 0; min-width: 44px; font-size: 11px; background: transparent; border: 0; }
+.gp-panel .gp-track-mix input { min-width: 0; flex: 1; }
+.gp-track-wave { width: 100%; height: 68px; cursor: crosshair; }
+.gp-ruler, .gp-track-wave { touch-action: none; user-select: none; }
+.gp-lane.silent .gp-track-wave { opacity: .3; }
+.gp-playhead { position: absolute; top: 24px; bottom: 0; width: 1px; background: var(--text); pointer-events: none; z-index: 3; }
+.gp-playhead::before { content: ''; position: absolute; top: 0; left: -4px; width: 9px; height: 9px; background: var(--text); clip-path: polygon(0 0,100% 0,50% 100%); }
+.gp-cycle { position: absolute; top: 0; bottom: 0; pointer-events: none; border: 1px solid #d6b54d; border-top: 6px solid #d6b54d; opacity: .45; background: #e5b33713; }
+.gp-cycle.enabled { opacity: 1; background: #e5b33722; }
+.gp-position { height: 24px; }
+.gp-panel .gp-position input { height: 24px; }
+.gp-tempo-settings, .gp-manual-fields { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.gp-tempo-settings label, .gp-import-tempo { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+.gp-tempo-settings select, .gp-import-tempo select { min-height: 44px; max-width: 100%; }
+.gp-import-tempo { margin-top: 20px; flex-wrap: wrap; }
+.gp-panel .gp-disclosure summary { padding: 8px 0; }
+.gp-panel .gp-mixer { border: 0; }
+.gp-manual-fields[hidden], .gp-cycle[hidden], .gp-playhead[hidden] { display: none; }
+@media (max-width: 900px) {
+  .gp-mode .layout { padding: 12px; }
+  .gp-mode .gp-panel { padding: 12px; }
+  .gp-arrangement { --track-header: 170px; }
+  .gp-speed-control { margin-left: 0; }
+}
+@media (max-width: 600px) {
+  .gp-arrangement { --track-header: 135px; }
+  .gp-track-header { height: 100px; }
+  .gp-track-wave { height: 100px; }
+  .gp-track-mix { flex-wrap: wrap; }
+  .gp-panel .gp-track-mix input { flex-basis: 100%; height: 30px; }
+  .gp-timeline-toolbar { flex-wrap: wrap; }
+  .gp-timeline-toolbar .muted { flex-basis: 100%; padding-top: 8px; }
+  .gp-pitch-control { margin-left: auto; }
+  .gp-panel .gp-speed-control input { width: 100px; }
+  .gp-command-row { gap: 6px; }
+  .gp-presets button { padding: 8px 10px; }
+  .gp-command-row .gp-presets { flex-basis: 100%; }
+}
+
+.gp-console { position: sticky; top: 0; z-index: 5; background: var(--panel); display: flex; flex-direction: column; gap: 12px; padding: 4px 0 8px; }
+.gp-tempo-settings label, .gp-import-tempo { white-space: nowrap; }
+.gp-tempo-settings select, .gp-import-tempo select { width: auto; }
+.gp-auto-fields { display: flex; align-items: center; gap: 8px; }
+.gp-auto-fields[hidden] { display: none; }
+.gp-mode .top { position: relative; z-index: 10; }
+
+/* Musical controls are separate from analysis settings: they change the audio. */
+.gp-musical-controls { display: flex; align-items: center; gap: 12px 28px; flex-wrap: wrap; }
+.gp-musical-control { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.gp-musical-control strong { font-size: 12px; min-width: 56px; }
+.gp-musical-control small { font-size: 11px; }
+.gp-panel .gp-musical-control button { padding: 6px 10px; }
+.gp-panel .gp-musical-control input[type=number] { width: 76px; text-align: center; }
+@media (max-width: 600px) {
+  .gp-musical-controls { gap: 8px; }
+  .gp-musical-control { gap: 4px; width: 100%; }
+  .gp-musical-control strong { min-width: 52px; }
+  .gp-musical-control small { font-size: 10px; }
+  .gp-musical-control .muted:last-child { flex-basis: 100%; }
+}
