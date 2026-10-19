@@ -1,7 +1,7 @@
 import { PracticeExport } from './practiceExport.ts';
 import { PracticeTimeline } from './practiceTimeline.ts';
 import type { BeatMode } from '../analysis/beatGrid.ts';
-import { canPreset, presetMix, type PracticeLane, type PracticePreset } from '../practice.ts';
+import type { PracticeLane } from '../practice.ts';
 import { $, fmtTime, h, pressed } from './dom.ts';
 
 export interface PracticeSnapshot {
@@ -64,7 +64,6 @@ export class PracticePanel {
   private autoFields = h('div', { class: 'gp-auto-fields' });
 
   private song: object | null = null;
-  private beforePreset: PracticeLane[] | null = null;
   private play: HTMLButtonElement;
   private seek: HTMLInputElement;
   private tempo: HTMLInputElement;
@@ -75,8 +74,6 @@ export class PracticePanel {
   private clickVol: HTMLInputElement;
   private bar: HTMLButtonElement;
   private loop: HTMLButtonElement;
-  private restore: HTMLButtonElement;
-  private presets: { preset: PracticePreset; el: HTMLButtonElement }[];
 
   constructor(private host: PracticeHost) {
     this.play = button('▶ 再生', () => host.toggle(), 'primary gp-play');
@@ -87,15 +84,6 @@ export class PracticePanel {
     this.clickVol = slider('クリック音量', 0.05, 1, 0.05, (v) => host.clickVolume(v));
     this.bar = button('強拍を1拍後ろへ', () => host.bar());
     this.loop = button('⟳ ループ', () => host.loop('toggle'), 'toggle');
-    this.presets = ([['no-guitar', 'ギターなし'], ['rhythm', 'リズムだけ'], ['all', '全パート']] as const).map(([preset, text]) => ({ preset, el: button(text, () => this.applyPreset(preset)) }));
-    this.restore = button('適用前に戻す', () => {
-      if (!this.beforePreset) return;
-      const before = this.beforePreset;
-      this.beforePreset = null;
-      host.mix(before);
-      this.status.textContent = '元の音量に戻しました。';
-      this.render();
-    });
     this.exporter = new PracticeExport(host, () => this.render());
     this.timeline = new PracticeTimeline({ ...host,
       snapshot: () => this.exporter.snapshot(host.snapshot()),
@@ -137,7 +125,7 @@ export class PracticePanel {
       h('div', { class: 'gp-musical-controls' },
         h('div', { class: 'gp-musical-control', role: 'group', 'aria-label': '曲のテンポ' }, h('strong', {}, '再生BPM'), this.bpmDown, this.playbackBpm, this.bpmUp, button('原速', () => host.tempo(1)), this.bpmReference),
         h('div', { class: 'gp-musical-control', role: 'group', 'aria-label': '曲の移調' }, h('strong', {}, 'キー'), this.pitchDown, this.pitchInput, this.pitchUp, h('small', { class: 'muted' }, '半音'), button('原曲キー', () => host.pitch(0)))),
-      h('div', { class: 'gp-command-row' }, h('div', { class: 'gp-presets', role: 'group', 'aria-label': '伴奏の選択' }, ...this.presets.map((p) => p.el)), this.click, this.beatInfo)),
+      h('div', { class: 'gp-command-row' }, this.click, this.beatInfo)),
       this.timeline.el,
       h('div', { class: 'gp-position' }, this.seek),
       h('div', { class: 'gp-tempo-settings' }, h('label', {}, 'テンポ', this.beatModeInput), this.manualFields, this.autoFields),
@@ -145,7 +133,7 @@ export class PracticePanel {
       h('details', { class: 'gp-loop gp-disclosure' }, this.loopSummary, h('div', { class: 'gp-detail-body' }, h('div', { class: 'gp-row' }, button('Aを設定', () => host.loop('a')), button('Bを設定', () => host.loop('b')), button('解除', () => host.loop('clear'))), this.loopInfo)),
       h('details', { class: 'gp-mixer gp-disclosure' }, h('summary', {}, '音量・メトロノームの調整'), h('div', { class: 'gp-detail-body' },
         h('div', { class: 'gp-tools' }, h('label', {}, '全体の音量', this.volume), h('label', {}, 'メトロノームの音量', this.clickVol)),
-        h('div', { class: 'gp-row' }, this.beats, this.bar, this.restore))),
+        h('div', { class: 'gp-row' }, this.beats, this.bar))),
       this.status);
     $('deck').prepend(el);
     const mode = button('詳細モード', () => setMode(!document.body.classList.contains('gp-mode')));
@@ -191,20 +179,10 @@ export class PracticePanel {
     window.dispatchEvent(new Event('resize'));
   }
 
-  private applyPreset(preset: PracticePreset) {
-    const s = this.host.snapshot();
-    if (!canPreset(s.lanes, preset)) return;
-    this.beforePreset ??= s.lanes.map((l) => ({ ...l }));
-    this.host.mix(presetMix(s.lanes, preset));
-    this.status.textContent = '伴奏を変更しました。';
-    this.render();
-  }
-
   render() {
     const s = this.host.snapshot();
     if (s.song !== this.song) {
       this.song = s.song;
-      this.beforePreset = null;
 
       this.status.textContent = '';
       this.showLibrary(false);
@@ -248,14 +226,7 @@ export class PracticePanel {
     pressed(this.loop, s.loop.on);
     this.loopSummary.textContent = s.loop.on ? '区間リピート · ON' : '区間リピート';
     this.loopInfo.textContent = s.loop.b > s.loop.a ? `${fmtTime(s.loop.a)} → ${fmtTime(s.loop.b)}${s.loop.on ? ' ・繰り返し中' : ' ・停止中'}` : 'A・Bを指定してください';
-    this.restore.disabled = !this.beforePreset;
     this.click.title = s.beatMode === 'manual' ? '手動BPMで再生' : s.beats.length ? '検出した拍に合わせて再生' : '拍データなし。再解析できます';
-    for (const p of this.presets) {
-      p.el.disabled = !canPreset(s.lanes, p.preset);
-      const target = presetMix(s.lanes, p.preset);
-      pressed(p.el, !p.el.disabled && target.every((l, i) => l.mute === s.lanes[i].mute && l.solo === s.lanes[i].solo));
-      p.el.title = p.el.disabled ? '必要な独立ステムがありません。6ステム分離、またはパート名を付けたマルチトラックを使ってください。' : '';
-    }
     // Binary search in the same measured beat map used by the AudioWorklet.
     let lo = 0, hi = s.beats.length;
     while (lo < hi) { const m = (lo + hi) >> 1; if (s.beats[m] <= s.position) lo = m + 1; else hi = m; }

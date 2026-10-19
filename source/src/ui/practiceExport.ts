@@ -16,7 +16,7 @@ export class PracticeExport {
   private message = '';
   private start = h('input', { type: 'text', inputMode: 'decimal', 'aria-label': '書き出し開始', placeholder: '0:00.000' });
   private end = h('input', { type: 'text', inputMode: 'decimal', 'aria-label': '書き出し終了', placeholder: '0:00.000' });
-  private format = h('select', { 'aria-label': '書き出し形式' }, h('option', { value: 'wav' }, 'WAV'), h('option', { value: 'mp3' }, 'MP3'));
+  private format = h('select', { 'aria-label': '書き出し形式' }, h('option', { value: 'mp3' }, 'MP3'), h('option', { value: 'wav' }, 'WAV'));
   private info = h('p', { class: 'muted small', role: 'status' });
   private drag = h('button', { type: 'button', class: 'btn' }, '波形で範囲を選ぶ');
   private save = h('button', { type: 'button', class: 'btn primary' }, '書き出す');

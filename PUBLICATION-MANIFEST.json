@@ -55,6 +55,11 @@
     "sha256": "7ea148675e2d7e4bd3c7ce534dd769b7d4506e316a5cf5a831d085b8f5d46702"
   },
   {
+    "path": "site/assets/index-BpvWbNny.js",
+    "bytes": 331725,
+    "sha256": "77c2e4ab54442f3c863d49474c76167bd5b4025a4fb31ebcfd515b667da8bfbd"
+  },
+  {
     "path": "site/assets/index-Cl8mb-Yn.css",
     "bytes": 49539,
     "sha256": "7595531cf67a65ab013f7f0c90561c796af2a53987a7bbb079b7378241314441"
@@ -142,7 +147,7 @@
   {
     "path": "site/index.html",
     "bytes": 62536,
-    "sha256": "6890002a4d9f2a9dbfccd66fbded9c908f7e5a94a94d1e1bc0da0728b85f3df6"
+    "sha256": "7db461337b11bfe56ee9021bfc46ec550cc9c544bed478653bf22a0699eba23f"
   },
   {
     "path": "site/manifest.webmanifest",
@@ -607,12 +612,12 @@
   {
     "path": "source/src/ui/practiceExport.ts",
     "bytes": 4839,
-    "sha256": "95b1dd56e88a03e22aa40bf49a2e008312f64af4fd9c81731a726eb4f206cf2a"
+    "sha256": "5d48890caf947d89b9b91a851fb184178a4a844bbe6798ff6a924cd0dbc364cc"
   },
   {
     "path": "source/src/ui/practicePanel.ts",
-    "bytes": 17542,
-    "sha256": "23b05801fbc8b10b6923e467cd2a218e59949dd379e7bed60385c86bf1cea22c"
+    "bytes": 15848,
+    "sha256": "c79fd03b868ee1d691fe251014f3b73f6a479a708badbaf5b05bca30e2dd0750"
   },
   {
     "path": "source/src/ui/practiceTimeline.ts",
