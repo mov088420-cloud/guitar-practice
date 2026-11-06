@@ -12,13 +12,14 @@ import { detectKey, rankKeys } from '../analysis/key.ts';
 import { cqt } from '../analysis/cqt.ts';
 
 export type EncodeReq =
-  | { type: 'stems'; id: number; stems: { name: string; data: Stereo }[]; out: OutputOptions }
+  | { type: 'stems'; id: number; stems: { name: string; data: Stereo; pitch?: number }[]; out: OutputOptions }
   | {
       type: 'mix';
       id: number;
       name: string;
       stems: Stereo[];
       gains: number[];
+      stemPitches?: number[];
       pans?: number[];
       eqs?: (EqParams | undefined)[];
       start: number;
@@ -83,11 +84,12 @@ async function writeFile(dir: FileSystemDirectoryHandle, name: string, bytes: Ui
 async function handle(m: EncodeReq) {
   if (m.type === 'stems') {
     for (const s of m.stems) {
-      const bytes = encodeAudio(s.data, m.out);
+      const audio = s.pitch ? renderMix([s.data], [1], 0, s.data[0].length, 1, 0, [], [], [s.pitch]) : s.data;
+      const bytes = encodeAudio(audio, m.out);
       post({ id: m.id, type: 'file', name: s.name, bytes }, [bytes.buffer as ArrayBuffer]);
     }
   } else if (m.type === 'mix') {
-    const mix = renderMix(m.stems, m.gains, m.start, m.end, m.tempo, m.pitch, m.pans, m.eqs);
+    const mix = renderMix(m.stems, m.gains, m.start, m.end, m.tempo, m.pitch, m.pans, m.eqs, m.stemPitches);
     const bytes = encodeAudio(mix, m.out);
     post({ id: m.id, type: 'file', name: m.name, bytes }, [bytes.buffer as ArrayBuffer]);
   } else if (m.type === 'lib-encode') {

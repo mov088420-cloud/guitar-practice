@@ -6,6 +6,7 @@ declare module 'soundtouchjs' {
     clear(): void;
   }
   export class SoundTouch {
+    readonly stretch: { quickSeek: boolean };
     tempo: number;
     pitchSemitones: number;
     readonly inputBuffer: FifoSampleBuffer;

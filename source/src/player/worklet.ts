@@ -10,7 +10,7 @@ export type PlayerMsg =
   | { type: 'load'; stems: Stereo[]; gains: number[] }
   | { type: 'addTrack'; stem: Stereo }
   | { type: 'replaceTrack'; index: number; stem: Stereo }
-  | { type: 'gains'; gains: number[]; pans?: number[]; eqs?: (EqParams | undefined)[] }
+  | { type: 'gains'; gains: number[]; pans?: number[]; eqs?: (EqParams | undefined)[]; stemPitches?: number[] }
   | { type: 'play' }
   | { type: 'pause' }
   | { type: 'seek'; pos: number }
@@ -89,6 +89,10 @@ class StemPlayer extends AudioWorkletProcessor {
         t.r.src.gains = m.gains;
         if (m.pans) t.r.src.pans = m.pans;
         if (m.eqs) t.r.src.setEqs(m.eqs);
+        if (m.stemPitches && t.r.src.setPitches(m.stemPitches)) {
+          t.r.seek(t.r.heard);
+          this.rs?.reset();
+        }
         break;
       case 'play':
         if (!this.playing) {

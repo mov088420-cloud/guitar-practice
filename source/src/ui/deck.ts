@@ -1,4 +1,6 @@
 import { boundedBpm, loadBeatMode, manualBeats, saveBeatMode, type BeatMode } from '../analysis/beatGrid.ts';
+import { boundedStemPitch } from '../player/stemPitch.ts';
+import { StemPitchControls } from './stemPitchControls.ts';
 import { PracticePanel } from './practicePanel.ts';
 import { Player } from '../player/player.ts';
 import { MediaSessionBridge } from './mediaSession.ts';
@@ -123,7 +125,7 @@ const DEFAULT_PR: PracticeUi = {
 /** Everything about how a song is set up in the player, saved per song. */
 export interface DeckState {
   masterVolume?: number;
-  lanes: { vol: number; pan: number; mute: boolean; solo: boolean; eq?: EqParams; height?: number; label?: string }[];
+  lanes: { vol: number; pan: number; pitch?: number; mute: boolean; solo: boolean; eq?: EqParams; height?: number; label?: string }[];
   loop: { on: boolean; a: number; b: number };
   tempo: number;
   pitch: number;
@@ -196,6 +198,8 @@ interface Lane {
   colour: string;
   vol: number;
   pan: number;
+  pitch: number;
+  pitchControls?: StemPitchControls;
   eq?: EqParams;
   eqPanel?: EqPanel;
   mute: boolean;
@@ -231,7 +235,7 @@ interface Take {
   native?: boolean;
 }
 
-type LanePatch = Partial<Pick<Lane, 'vol' | 'pan' | 'mute' | 'solo' | 'eq'>>;
+type LanePatch = Partial<Pick<Lane, 'vol' | 'pan' | 'mute' | 'solo' | 'eq' | 'pitch'>>;
 /** One undoable mixer action: before/after only cover the fields that actually changed. */
 interface LaneHistoryEntry {
   lane: Lane;
@@ -676,7 +680,7 @@ export class Deck {
         position: this.player.state.pos / SR, playing: this.player.state.playing,
         tempo: this.tempo, pitch: this.pitch, volume: this.masterVolume,
         sourceBpm: this.pr.beatMode === 'manual' ? this.pr.manualBpm : this.r?.analysis?.bpm ?? 0,
-        lanes: this.lanes.map((l) => ({ name: l.name, vol: l.vol, mute: l.mute, solo: l.solo, peaks: l.peaks, colour: l.colour })),
+        lanes: this.lanes.map((l) => ({ name: l.name, pitch: l.pitch, vol: l.vol, mute: l.mute, solo: l.solo, peaks: l.peaks, colour: l.colour })),
         loop: { on: this.loop.on, a: this.loop.a / SR, b: this.loop.b / SR },
         click: this.pr.click, clickVol: this.pr.clickVol, beats: this.beatSeconds(),
         beatMode: this.beatMode, manualBpm: this.pr.manualBpm, manualOffset: this.pr.manualOffset, beatBusy: this.beatBusy,
@@ -705,7 +709,8 @@ export class Deck {
       lane: (i, patch) => {
         const lane = this.lanes[i];
         if (!lane) return;
-        this.setLane(lane, patch);
+        if ('pitch' in patch) this.setLaneRecorded(lane, patch);
+        else this.setLane(lane, patch);
         this.syncLaneSliders(lane, patch);
       },
       mix: (mix) => {
@@ -778,7 +783,10 @@ export class Deck {
     });
     const el = h('div', { class: 'lane', style: `--c:${colour}` }, ctl, wave, resizeHandle);
     $('lanes').append(el);
-    const lane: Lane = { name: s.name, colour, vol: 1, pan: 0, mute: false, solo: false, el, canvas, peaks: peaksOf(s.data), data: s.data, tabBtn };
+    const lane: Lane = { name: s.name, colour, vol: 1, pan: 0, pitch: 0, mute: false, solo: false, el, canvas, peaks: peaksOf(s.data), data: s.data, tabBtn };
+    lane.pitchControls = new StemPitchControls(laneLabel(lane), () => lane.pitch, pitch => this.setLaneRecorded(lane, { pitch }));
+    ctl.append(lane.pitchControls.el);
+    lane.pitchControls.render(0);
     tabBtn.onclick = () => this.openPartForLane(lane);
     eqBtn.onclick = () => this.toggleEq(lane, lane.colour);
     pressed(eqBtn, false);
@@ -963,7 +971,7 @@ export class Deck {
       lane.takes = [];
       this.lanes.push(lane);
       this.player.addTrack(data);
-      this.player.setGains(this.gains(), this.pans(), this.eqs());
+      this.player.setGains(this.gains(), this.pans(), this.eqs(), this.stemPitches());
     } else {
       lane.data = [new Float32Array(this.length), new Float32Array(this.length)];
     }
@@ -1202,7 +1210,7 @@ export class Deck {
       lane.takesEl?.remove();
       lane.el.remove();
       this.lanes.splice(this.lanes.indexOf(lane), 1);
-      this.player.setGains(this.gains(), this.pans(), this.eqs());
+      this.player.setGains(this.gains(), this.pans(), this.eqs(), this.stemPitches());
       this.refreshRecordTargetsUi();
       this.dirty = true;
       this.emit();
@@ -1283,7 +1291,7 @@ export class Deck {
     this.lastPracticed = undefined;
     this.lastPracticeTick = null;
     this.lanes = r.stems.map((s, i) => this.buildLane(s, i));
-    this.player.load(r.stems.map((s) => s.data), this.gains(), r.libId);
+    this.player.load(r.stems.map((s) => s.data), this.gains(), state?.lanes?.some(l => boundedStemPitch(l.pitch)) ? undefined : r.libId);
     this.restoreTakes(r);
     if (state) this.applyState(state); // restores practiceSeconds/lastPracticed too, if saved
     this.refreshTunerSources();
@@ -1328,7 +1336,7 @@ export class Deck {
   getState(): DeckState {
     return {
       masterVolume: this.masterVolume,
-      lanes: this.lanes.map((l) => ({ vol: l.vol, pan: l.pan, mute: l.mute, solo: l.solo, eq: l.eq, height: l.height, label: l.label })),
+      lanes: this.lanes.map((l) => ({ vol: l.vol, pan: l.pan, pitch: l.pitch, mute: l.mute, solo: l.solo, eq: l.eq, height: l.height, label: l.label })),
       loop: { ...this.loop },
       tempo: this.tempo,
       pitch: this.pitch,
@@ -1357,6 +1365,7 @@ export class Deck {
       const l = this.lanes[i];
       if (!l) return;
       Object.assign(l, st);
+      l.pitch = boundedStemPitch(st.pitch);
       (l.el.querySelectorAll('input[type=range]')[0] as HTMLInputElement).value = String(l.vol);
       const pan = l.el.querySelectorAll('input[type=range]')[1] as HTMLInputElement;
       pan.value = String(l.pan);
@@ -1409,7 +1418,7 @@ export class Deck {
     const pos = this.player.state.pos;
     this.player.load(this.r.stems.map((s) => s.data), this.gains()); // no library id: the web engine
     for (const l of this.lanes.slice(this.r.stems.length)) this.player.addTrack(l.data);
-    this.player.setGains(this.gains(), this.pans(), this.eqs());
+    this.player.setGains(this.gains(), this.pans(), this.eqs(), this.stemPitches());
     this.setTempoPitch(this.tempo, this.pitch, false);
     this.player.setLoop(this.loop.on, this.loop.a, this.loop.b);
     this.sendPractice();
@@ -3414,12 +3423,16 @@ export class Deck {
         if (token !== this.fadeToken) return resolve(); // superseded by a newer fade
         const p = ms <= 0 ? 1 : Math.min(1, (t - t0) / ms);
         this.fadeMul = start + (target - start) * p;
-        this.player.setGains(this.gains(), this.pans(), this.eqs());
+        this.player.setGains(this.gains(), this.pans(), this.eqs(), this.stemPitches());
         if (p < 1) requestAnimationFrame(step);
         else resolve();
       };
       requestAnimationFrame(step);
     });
+  }
+
+  private stemPitches() {
+    return this.lanes.map(l => boundedStemPitch(l.pitch));
   }
 
   private pans() {
@@ -3450,14 +3463,20 @@ export class Deck {
   }
 
   private setLane(l: Lane, patch: LanePatch) {
+    if ('pitch' in patch && !this.player.supportsStemPitch) {
+      toast('個別のキー変更はブラウザ版で使用できます。', true);
+      return;
+    }
     Object.assign(l, patch);
+    l.pitch = boundedStemPitch(l.pitch);
+    l.pitchControls?.render(l.pitch);
     this.dirty = true;
     this.emit();
     pressed(l.el.querySelector('.m')!, l.mute);
     pressed(l.el.querySelector('.s')!, l.solo);
     const g = this.gains();
     this.lanes.forEach((x, i) => x.el.classList.toggle('off', g[i] === 0));
-    this.player.setGains(g, this.pans(), this.eqs());
+    this.player.setGains(g, this.pans(), this.eqs(), this.stemPitches());
     for (const x of this.lanes) x.el.querySelector('.eq')!.classList.toggle('on', !isFlat(x.eq));
     // If pan is hidden but in use, say so on the button so it isn't forgotten.
     $('panToggle').textContent = this.lanes.some((x) => x.pan) ? 'Pan (active)' : 'Pan';
@@ -3471,7 +3490,9 @@ export class Deck {
     const before = {} as LanePatch;
     for (const k of Object.keys(patch) as (keyof LanePatch)[]) (before as any)[k] = l[k];
     this.setLane(l, patch);
-    this.pushLaneHistory(l, before, patch);
+    const after = {} as LanePatch;
+    for (const k of Object.keys(patch) as (keyof LanePatch)[]) (after as any)[k] = l[k];
+    this.pushLaneHistory(l, before, after);
   }
 
   private pushLaneHistory(lane: Lane, before: LanePatch, after: LanePatch) {
@@ -4499,7 +4520,7 @@ export class Deck {
     const o = this.settings();
     const t = toast(`Encoding ${laneLabel(lane)}…`);
     try {
-      await this.encoder.run({ type: 'stems', stems: [{ name: safeName(laneLabel(lane)), data: lane.data }], out: o }, async (name, bytes) => {
+      await this.encoder.run({ type: 'stems', stems: [{ name: safeName(laneLabel(lane)), data: lane.data, pitch: lane.pitch }], out: o }, async (name, bytes) => {
         await saveFile(`${this.baseName()} - ${name}.${extensionFor(o)}`, bytes, mimeFor(o));
       });
     } catch (e) {
@@ -4527,7 +4548,7 @@ export class Deck {
       const n = (seen.get(name.toLowerCase()) ?? 0) + 1;
       seen.set(name.toLowerCase(), n);
       if (n > 1) name = `${name} (${n})`;
-      return { name, data: l.data };
+      return { name, data: l.data, pitch: l.pitch };
     });
     try {
       await this.encoder.run({ type: 'stems', stems, out: o }, async (name, bytes) => {
@@ -4559,6 +4580,7 @@ export class Deck {
       on.length === this.lanes.length ? 'mix' : on.join('+') || 'silence',
       this.tempo !== 1 ? `${Math.round(this.tempo * 100)}%` : '',
       this.pitch ? `${this.pitch > 0 ? '+' : ''}${this.pitch}st` : '',
+      this.lanes.some((l, i) => g[i] > 0 && l.pitch) ? 'track-keys' : '',
       this.lanes.some((l, i) => g[i] > 0 && !isFlat(l.eq)) ? 'EQ' : '',
       useLoop ? `${fmtTime(start / SR).replace(':', '.')}-${fmtTime(end / SR).replace(':', '.')}` : '',
     ].filter(Boolean);
@@ -4568,7 +4590,7 @@ export class Deck {
     btn.textContent = 'Rendering…';
     try {
       await this.encoder.run(
-        { type: 'mix', name, stems: this.r.stems.map((s) => s.data), gains: g, pans: this.pans(), eqs: this.eqs(), start, end, tempo: this.tempo, pitch: this.pitch, out: o },
+        { type: 'mix', name, stems: this.lanes.map((l) => l.data), gains: g, pans: this.pans(), eqs: this.eqs(), stemPitches: this.stemPitches(), start, end, tempo: this.tempo, pitch: this.pitch, out: o },
         async (n, bytes) => void (await saveFile(n, bytes, mimeFor(o))),
       );
     } catch (e) {

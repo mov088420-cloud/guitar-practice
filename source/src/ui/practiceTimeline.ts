@@ -1,3 +1,4 @@
+import { StemPitchControls } from './stemPitchControls.ts';
 import { h, fmtTime, pressed } from './dom.ts';
 import { STEM_LABELS } from '../practice.ts';
 import type { PracticeHost, PracticeSnapshot } from './practicePanel.ts';
@@ -12,7 +13,7 @@ export class PracticeTimeline {
   private cycle = h('div', { class: 'gp-cycle' });
   private playhead = h('div', { class: 'gp-playhead' });
   private scroll = h('input', { type: 'range', min: '0', max: '1000', value: '0', 'aria-label': '波形の表示位置' });
-  private controls: { el: HTMLElement; canvas: HTMLCanvasElement; vol: HTMLInputElement; mute: HTMLButtonElement; solo: HTMLButtonElement; peaks: Float32Array }[] = [];
+  private controls: { el: HTMLElement; canvas: HTMLCanvasElement; vol: HTMLInputElement; mute: HTMLButtonElement; solo: HTMLButtonElement; peaks: Float32Array; pitch: StemPitchControls }[] = [];
   private song: object | null = null;
   private start = 0;
   private span = 1;
@@ -77,10 +78,11 @@ export class PracticeTimeline {
         solo.onclick = () => this.host.lane(i, { solo: !this.host.snapshot().lanes[i].solo });
         const vol = h('input', { type: 'range', min: '0', max: '1.5', step: '.01', 'aria-label': `${label}の音量` });
         vol.oninput = () => this.host.lane(i, { vol: Number(vol.value) });
+        const pitch = new StemPitchControls(label, () => this.host.snapshot().lanes[i].pitch ?? 0, value => this.host.lane(i, { pitch: value }));
         const canvas = h('canvas', { class: 'gp-track-wave', 'aria-label': `${label}の波形` });
         this.bindPointer(canvas);
-        const el = h('div', { class: 'gp-lane', 'data-stem': l.name, style: `--track-color:${l.colour}` }, h('div', { class: 'gp-track-header' }, h('strong', {}, label), h('div', { class: 'gp-track-mix' }, mute, solo, vol)), canvas);
-        return { el, canvas, vol, mute, solo, peaks: l.peaks };
+        const el = h('div', { class: 'gp-lane', 'data-stem': l.name, style: `--track-color:${l.colour}` }, h('div', { class: 'gp-track-header' }, h('strong', {}, label), h('div', { class: 'gp-track-mix' }, mute, solo, vol), pitch.el), canvas);
+        return { el, canvas, vol, mute, solo, pitch, peaks: l.peaks };
       });
       const order = ['guitar', 'drums', 'bass', 'vocals', 'piano', 'other'];
       this.rows.replaceChildren(...this.controls.map((c, i) => ({ c, rank: order.indexOf(s.lanes[i].name.toLowerCase()) })).sort((a, b) => (a.rank < 0 ? 99 : a.rank) - (b.rank < 0 ? 99 : b.rank)).map(({ c }) => c.el));
@@ -89,6 +91,7 @@ export class PracticeTimeline {
     const soloed = s.lanes.some(l => l.solo);
     this.controls.forEach((c, i) => {
       const l = s.lanes[i];
+      c.pitch.render(l.pitch ?? 0);
       c.vol.value = String(l.vol); pressed(c.mute, l.mute); pressed(c.solo, l.solo);
       c.el.classList.toggle('silent', soloed ? !l.solo : l.mute);
       if (c.peaks !== l.peaks) { c.peaks = l.peaks; this.dirty = true; }

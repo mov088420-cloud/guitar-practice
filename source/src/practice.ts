@@ -1,6 +1,6 @@
 // Pure preset policy: never infer a missing guitar from the four-stem "other" track.
 export type PracticePreset = 'no-guitar' | 'rhythm' | 'all';
-export interface PracticeLane { name: string; vol: number; mute: boolean; solo: boolean }
+export interface PracticeLane { name: string; pitch?: number; vol: number; mute: boolean; solo: boolean }
 export function canPreset(lanes: readonly PracticeLane[], preset: PracticePreset): boolean {
   const names = lanes.map((l) => l.name.toLowerCase());
   return preset === 'all' || (preset === 'no-guitar' ? names.includes('guitar') : names.includes('drums') && names.includes('bass'));

@@ -983,7 +983,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .gp-command-row .gp-presets { flex: 1; }
 .gp-presets button { min-height: 44px; flex: initial; padding: 8px 18px; }
 .gp-command-row > .muted { font-size: 12px; }
-.gp-arrangement { --track-header: 200px; min-width: 0; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.gp-arrangement { --track-header: 228px; min-width: 0; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
 .gp-timeline-toolbar { display: flex; align-items: center; gap: 6px; padding: 0 8px; background: var(--panel-2); }
 .gp-timeline-toolbar .muted { margin-right: auto; font-size: 11px; }
 .gp-timeline-toolbar .btn { border: 0; background: transparent; padding: 4px 10px; }
@@ -994,12 +994,12 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .gp-ruler { width: 100%; height: 32px; }
 .gp-lane { border-bottom: 1px solid var(--line); background: var(--panel); }
 .gp-lane:last-child { border-bottom: 0; }
-.gp-track-header { height: 68px; padding: 4px 10px; border-left: 3px solid var(--track-color); border-right: 1px solid var(--line); background: var(--panel-2); }
+.gp-track-header { height: 164px; padding: 4px 10px; border-left: 3px solid var(--track-color); border-right: 1px solid var(--line); background: var(--panel-2); }
 .gp-track-header strong { font-size: 12px; display: block; height: 16px; }
 .gp-track-mix { display: flex; gap: 3px; align-items: center; }
 .gp-track-mix .gp-ms { padding: 0; min-width: 44px; font-size: 11px; background: transparent; border: 0; }
 .gp-panel .gp-track-mix input { min-width: 0; flex: 1; }
-.gp-track-wave { width: 100%; height: 68px; cursor: crosshair; }
+.gp-track-wave { width: 100%; height: 164px; cursor: crosshair; }
 .gp-ruler, .gp-track-wave { touch-action: none; user-select: none; }
 .gp-lane.silent .gp-track-wave { opacity: .3; }
 .gp-playhead { position: absolute; top: 24px; bottom: 0; width: 1px; background: var(--text); pointer-events: none; z-index: 3; }
@@ -1018,15 +1018,12 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 @media (max-width: 900px) {
   .gp-mode .layout { padding: 12px; }
   .gp-mode .gp-panel { padding: 12px; }
-  .gp-arrangement { --track-header: 170px; }
+  .gp-arrangement { --track-header: 220px; }
   .gp-speed-control { margin-left: 0; }
 }
 @media (max-width: 600px) {
-  .gp-arrangement { --track-header: 135px; }
-  .gp-track-header { height: 100px; }
-  .gp-track-wave { height: 100px; }
-  .gp-track-mix { flex-wrap: wrap; }
-  .gp-panel .gp-track-mix input { flex-basis: 100%; height: 30px; }
+  .gp-arrangement { --track-header: 196px; }
+  .gp-track-header { padding-left: 6px; padding-right: 6px; }
   .gp-timeline-toolbar { flex-wrap: wrap; }
   .gp-timeline-toolbar .muted { flex-basis: 100%; padding-top: 8px; }
   .gp-pitch-control { margin-left: auto; }
@@ -1063,3 +1060,14 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .gp-export-fields input, .gp-export-fields select { width: 100%; min-height: 44px; }
 .gp-export-select .gp-cycle { border-color: #67d9cf; background: #67d9cf22; }
 .gp-export-fields input { background: var(--surface, #191920); color: inherit; border: 1px solid var(--border, #303039); border-radius: 8px; padding: 8px 12px; }
+
+/* Per-track transposition; offsets are added to the song-wide key. */
+.gp-stem-pitch { display: grid; gap: 4px; min-width: 0; }
+.gp-stem-key-row { display: grid; grid-template-columns: auto 44px minmax(0, 1fr) 44px; align-items: center; gap: 4px; }
+.gp-stem-key-row > span { font-size: 11px; }
+.gp-stem-oct-row { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 4px; }
+.gp-stem-pitch .btn { min-width: 0; min-height: 44px; padding: 2px 3px; font-size: 11px; white-space: nowrap; }
+.gp-stem-pitch input[type=number] { width: 100%; min-width: 0; min-height: 44px; padding: 3px; text-align: center; font-size: 16px; background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 6px; }
+.gp-stem-pitch.shifted input { border-color: var(--accent); color: var(--accent); }
+.lane-ctl > .gp-stem-pitch { grid-column: 1 / -1; }
+.lane:has(.gp-stem-pitch) .wave { min-height: 164px; }

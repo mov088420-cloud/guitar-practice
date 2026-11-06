@@ -1,6 +1,7 @@
 // Mixing, looping and time-stretch/pitch-shift, shared by the real-time
 // AudioWorklet player and the offline "export mix" renderer.
 
+import { boundedStemPitch } from './stemPitch.ts';
 import { SoundTouch } from 'soundtouchjs';
 import { StemEq, type EqParams } from './eq.ts';
 
@@ -54,6 +55,37 @@ export class MixSource {
   }
 
   pans: number[] = [];
+  private pitches: number[] = [];
+  private pitchReaders = new Map<number, { stem: Stereo; renderer: Renderer; next: number }>();
+  setPitches(values: number[]): boolean {
+    const next = this.stems.map((_, i) => boundedStemPitch(values[i]));
+    const changed = next.some((v, i) => v !== (this.pitches[i] ?? 0));
+    this.pitches = next;
+    if (changed) this.pitchReaders.clear();
+    return changed;
+  }
+
+  /** Render each shifted stem on the same source-frame timeline, before EQ and mixing.
+   * Zero-pitch stems keep the original fast path. Readers have bounded buffers, not song copies. */
+  private pitched(index: number, frames: number): Stereo {
+    const stem = this.stems[index];
+    const end = Math.min(stem[0].length, this.looping ? this.loopEnd : this.end);
+    let reader = this.pitchReaders.get(index);
+    if (!reader || reader.stem !== stem || reader.renderer.src.end !== end) {
+      const source = new MixSource([stem], [1], end);
+      source.padEnd = 32768;
+      const renderer = new Renderer(source, true);
+      renderer.setTempoPitch(1, this.pitches[index]);
+      reader = { stem, renderer, next: -1 };
+      this.pitchReaders.set(index, reader);
+    }
+    if (reader.next !== this.pos) reader.renderer.seek(this.pos);
+    if (this.tmpL.length < frames) [this.tmpL, this.tmpR] = [new Float32Array(frames), new Float32Array(frames)];
+    const got = reader.renderer.render(this.tmpL, this.tmpR, frames);
+    this.tmpL.fill(0, got, frames); this.tmpR.fill(0, got, frames);
+    reader.next = this.pos + frames;
+    return [this.tmpL, this.tmpR];
+  }
   /** Metronome mixed into the source, so it is stretched in step with the music. */
   click: ClickTrack | null = null;
   private eqs: StemEq[] = [];
@@ -67,6 +99,7 @@ export class MixSource {
   /** Clear filter memory (after a seek, so old audio doesn't ring on). */
   resetEqs() {
     for (const e of this.eqs) e?.reset();
+    this.pitchReaders.clear();
   }
 
   constructor(
@@ -102,6 +135,10 @@ export class MixSource {
         if (!g) continue;
         let [l, r] = this.stems[s];
         let p0 = this.pos;
+        if (this.pitches[s]) {
+          [l, r] = this.pitched(s, n);
+          p0 = 0;
+        }
         const eq = this.eqs[s];
         if (eq?.active) {
           if (this.tmpL.length < n) [this.tmpL, this.tmpR] = [new Float32Array(n), new Float32Array(n)];
@@ -164,7 +201,10 @@ export class Renderer {
   /** Source position (frames) of the audio most recently output. */
   heard = 0;
 
-  constructor(public src: MixSource) {}
+  constructor(public src: MixSource, accuratePitch = false) {
+    // Full overlap search avoids audible detuning on low notes at large downward shifts.
+    if (accuratePitch) this.st.stretch.quickSeek = false;
+  }
 
   get bypass() {
     return this.tempo === 1 && this.pitch === 0;
@@ -232,12 +272,14 @@ export function renderMix(
   pitch: number,
   pans: number[] = [],
   eqs: (EqParams | undefined)[] = [],
+  stemPitches: number[] = [],
 ): Stereo {
   start = Math.round(start);
   end = Math.round(end);
   const src = new MixSource(stems, gains, end);
   src.pans = pans;
   src.setEqs(eqs);
+  src.setPitches(stemPitches);
   src.padEnd = 32768;
   const r = new Renderer(src);
   r.setTempoPitch(tempo, pitch);

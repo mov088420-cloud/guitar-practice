@@ -275,9 +275,10 @@ export class Player {
     this.state = { ...this.state, pos: 0, playing: false, passes: 0 };
     void this.init();
   }
-  setGains(gains: number[], pans?: number[], eqs?: (EqParams | undefined)[]) {
+  get supportsStemPitch() { return !this.nativeSong; }
+  setGains(gains: number[], pans?: number[], eqs?: (EqParams | undefined)[], stemPitches?: number[]) {
     if (this.nativeSong) return this.nativeCall('native_engine_gains', { gains, pans: pans ?? null, eqs: eqs ? eqs.map((e) => e ?? null) : null });
-    this.send({ type: 'gains', gains, pans, eqs });
+    this.send({ type: 'gains', gains, pans, eqs, stemPitches });
   }
   /** Adds a track to the playing song in place, without resetting playback (unlike load()). Follow up with setGains() to size the gain/pan/EQ arrays to match. */
   addTrack(stem: Stereo) {
