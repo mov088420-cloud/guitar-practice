@@ -28,8 +28,10 @@ export class StemPitchControls {
   render(value: number) {
     const pitch = boundedStemPitch(value);
     if (document.activeElement !== this.input) this.input.value = String(pitch);
-    this.minus.disabled = this.down.disabled = pitch <= -MAX_STEM_PITCH;
-    this.plus.disabled = this.up.disabled = pitch >= MAX_STEM_PITCH;
+    this.minus.disabled = pitch <= -MAX_STEM_PITCH;
+    this.plus.disabled = pitch >= MAX_STEM_PITCH;
+    this.down.disabled = pitch - 12 < -MAX_STEM_PITCH;
+    this.up.disabled = pitch + 12 > MAX_STEM_PITCH;
     this.reset.disabled = pitch === 0;
     this.el.classList.toggle('shifted', pitch !== 0);
   }
